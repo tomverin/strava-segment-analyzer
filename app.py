@@ -5,17 +5,34 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import json
 import time
+import logging
 from cache_manager import cache
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv('SECRET_KEY', 'your-secret-key-here')
+app.secret_key = os.getenv('SECRET_KEY', 'fallback-secret-key-for-cloud-deployment')
 
 # Strava API configuration
 STRAVA_CLIENT_ID = os.getenv('STRAVA_CLIENT_ID')
 STRAVA_CLIENT_SECRET = os.getenv('STRAVA_CLIENT_SECRET')
 STRAVA_REDIRECT_URI = os.getenv('STRAVA_REDIRECT_URI', 'http://localhost:8000/auth/callback')
+
+logger.info(f"App starting...")
+logger.info(f"STRAVA_CLIENT_ID: {'SET' if STRAVA_CLIENT_ID else 'NOT SET'}")
+logger.info(f"STRAVA_CLIENT_SECRET: {'SET' if STRAVA_CLIENT_SECRET else 'NOT SET'}")
+logger.info(f"STRAVA_REDIRECT_URI: {STRAVA_REDIRECT_URI}")
+
+# Ensure cache directory exists
+try:
+    os.makedirs('cache', exist_ok=True)
+    logger.info("Cache directory verified")
+except Exception as e:
+    logger.warning(f"Could not create cache directory: {e}")
 
 # Strava API endpoints
 STRAVA_AUTH_URL = 'https://www.strava.com/oauth/authorize'
@@ -25,6 +42,7 @@ STRAVA_API_BASE = 'https://www.strava.com/api/v3'
 @app.route('/')
 def index():
     """Main page - check if user is authenticated"""
+    logger.info(f"Index route accessed. Session has access_token: {'access_token' in session}")
     if 'access_token' not in session:
         return redirect(url_for('login'))
     return render_template('index.html')
@@ -32,15 +50,35 @@ def index():
 @app.route('/login')
 def login():
     """Redirect to Strava OAuth login"""
+    logger.info("Login route accessed")
+    
+    if not STRAVA_CLIENT_ID:
+        logger.error("STRAVA_CLIENT_ID not configured")
+        return "Configuration Error: STRAVA_CLIENT_ID not set. Please check environment variables.", 500
+    
     auth_url = f"{STRAVA_AUTH_URL}?client_id={STRAVA_CLIENT_ID}&response_type=code&redirect_uri={STRAVA_REDIRECT_URI}&approval_prompt=force&scope=read,activity:read_all"
+    logger.info(f"Redirecting to: {auth_url}")
     return redirect(auth_url)
 
 @app.route('/auth/callback')
 def auth_callback():
     """Handle Strava OAuth callback"""
     code = request.args.get('code')
+    error = request.args.get('error')
+    
+    logger.info(f"Auth callback received. Code: {'SET' if code else 'NOT SET'}, Error: {error}")
+    
+    if error:
+        logger.error(f"OAuth error: {error}")
+        return f"Authorization failed: {error}", 400
+        
     if not code:
-        return "Authorization failed", 400
+        logger.error("No authorization code received")
+        return "Authorization failed - no code received", 400
+    
+    if not STRAVA_CLIENT_ID or not STRAVA_CLIENT_SECRET:
+        logger.error("Strava credentials not configured")
+        return "Configuration Error: Strava API credentials not set. Please check environment variables.", 500
     
     # Exchange code for access token
     token_data = {
@@ -50,45 +88,60 @@ def auth_callback():
         'grant_type': 'authorization_code'
     }
     
+    logger.info("Exchanging code for access token...")
     response = requests.post(STRAVA_TOKEN_URL, data=token_data)
+    logger.info(f"Token exchange response status: {response.status_code}")
+    
     if response.status_code == 200:
         token_info = response.json()
         session['access_token'] = token_info['access_token']
         session['refresh_token'] = token_info['refresh_token']
         session['athlete_id'] = token_info['athlete']['id']
+        logger.info(f"Successfully authenticated athlete: {token_info['athlete']['id']}")
         return redirect(url_for('index'))
     else:
-        return "Token exchange failed", 400
+        logger.error(f"Token exchange failed: {response.status_code} - {response.text}")
+        return f"Token exchange failed: {response.text}", 400
 
 @app.route('/logout')
 def logout():
     """Clear session and logout"""
+    logger.info("User logging out")
     session.clear()
     return redirect(url_for('login'))
 
 @app.route('/segment/<int:segment_id>/efforts')
 def get_segment_efforts(segment_id):
     """Get all efforts for a specific segment"""
+    logger.info(f"Getting efforts for segment {segment_id}")
+    
     if 'access_token' not in session:
+        logger.warning("No access token in session")
         return jsonify({'error': 'Not authenticated'}), 401
     
     access_token = session['access_token']
     athlete_id = session['athlete_id']
     
+    logger.info(f"User authenticated: athlete_id={athlete_id}")
+    
     # Check for fallback mode (skip heart rate streams to avoid rate limits)
     fallback_mode = request.args.get('fallback', 'false').lower() == 'true'
+    logger.info(f"Fallback mode: {fallback_mode}")
     
     # Get segment info for VAM calculation
     segment_info = cache.get('segment', str(segment_id))
     if segment_info is None:
         headers = {'Authorization': f'Bearer {access_token}'}
         segment_url = f"{STRAVA_API_BASE}/segments/{segment_id}"
+        logger.info(f"Fetching segment info from: {segment_url}")
         segment_response = requests.get(segment_url, headers=headers)
+        logger.info(f"Segment API response: {segment_response.status_code}")
         if segment_response.status_code == 200:
             segment_info = segment_response.json()
             cache.set('segment', str(segment_id), segment_info)
         else:
-            return jsonify({'error': 'Failed to fetch segment info'}), 400
+            logger.error(f"Failed to fetch segment info: {segment_response.status_code} - {segment_response.text}")
+            return jsonify({'error': f'Failed to fetch segment info: {segment_response.text}'}), 400
     
     # Check cache for segment efforts first (shorter TTL as new efforts can be added)
     efforts_cache_key = f"{segment_id}_{athlete_id}"
@@ -104,13 +157,20 @@ def get_segment_efforts(segment_id):
             'per_page': 200  # Maximum allowed
         }
         
+        logger.info(f"Fetching efforts from: {efforts_url} with params: {params}")
         response = requests.get(efforts_url, headers=headers, params=params)
+        logger.info(f"Efforts API response: {response.status_code}")
+        
         if response.status_code != 200:
-            return jsonify({'error': 'Failed to fetch efforts'}), 400
+            logger.error(f"Failed to fetch efforts: {response.status_code} - {response.text}")
+            return jsonify({'error': f'Failed to fetch efforts: {response.text}'}), 400
         
         efforts = response.json()
+        logger.info(f"Found {len(efforts)} efforts")
         # Cache efforts for 1 hour (new efforts might be added)
         cache.set('efforts', efforts_cache_key, efforts)
+    else:
+        logger.info(f"Using cached efforts: {len(efforts)} efforts")
     
     headers = {'Authorization': f'Bearer {access_token}'}
     
@@ -136,9 +196,10 @@ def get_segment_efforts(segment_id):
                 cache.set('activity', str(activity_id), activity_data)
             elif activity_response.status_code == 429:
                 # Rate limit hit - return what we have so far
-                print(f"Rate limit hit after processing {i} efforts")
+                logger.warning(f"Rate limit hit after processing {i} efforts")
                 break
             else:
+                logger.warning(f"Failed to get activity {activity_id}: {activity_response.status_code}")
                 continue  # Skip this effort if we can't get activity data
         
         if activity_data:
@@ -190,7 +251,7 @@ def get_segment_efforts(segment_id):
             }
             detailed_efforts.append(effort_detail)
 
-    
+    logger.info(f"Returning {len(detailed_efforts)} detailed efforts")
     return jsonify(detailed_efforts)
 
 def get_segment_heart_rate_from_streams(activity_id, effort, headers):
@@ -307,6 +368,33 @@ def clear_cache():
     
     cache.clear_expired()
     return jsonify({'message': 'Expired cache entries cleared'})
+
+@app.route('/health')
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'strava_client_id_set': bool(STRAVA_CLIENT_ID),
+        'strava_client_secret_set': bool(STRAVA_CLIENT_SECRET),
+        'strava_redirect_uri': STRAVA_REDIRECT_URI,
+        'session_has_token': 'access_token' in session,
+        'cache_directory_exists': os.path.exists('cache')
+    })
+
+@app.route('/debug')
+def debug_info():
+    """Debug information (non-sensitive)"""
+    return f"""
+    <h2>Debug Information</h2>
+    <p><strong>STRAVA_CLIENT_ID:</strong> {'✅ SET' if STRAVA_CLIENT_ID else '❌ NOT SET'}</p>
+    <p><strong>STRAVA_CLIENT_SECRET:</strong> {'✅ SET' if STRAVA_CLIENT_SECRET else '❌ NOT SET'}</p>
+    <p><strong>STRAVA_REDIRECT_URI:</strong> {STRAVA_REDIRECT_URI}</p>
+    <p><strong>Cache Directory:</strong> {'✅ EXISTS' if os.path.exists('cache') else '❌ MISSING'}</p>
+    <p><strong>Session has token:</strong> {'✅ YES' if 'access_token' in session else '❌ NO'}</p>
+    <hr>
+    <p><a href="/health">Health Check (JSON)</a></p>
+    <p><a href="/">Back to App</a></p>
+    """
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
