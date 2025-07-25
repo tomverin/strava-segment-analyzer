@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Strava Segment Analyzer{% endblock %}</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <nav class="bg-orange-500 shadow-lg">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between h-16">
+                            <div class="flex items-center">
+                <a href="{{ url_for('index') }}" class="flex items-center hover:text-orange-200 transition duration-200">
+                    <i class="fas fa-mountain text-white text-2xl mr-3"></i>
+                    <h1 class="text-white text-xl font-bold">Strava Segment Analyzer</h1>
+                </a>
+            </div>
+            <div class="flex items-center space-x-4">
+                {% if session.access_token %}
+                    {% if request.endpoint == 'segment_analyzer' %}
+                        <a href="{{ url_for('index') }}" class="text-white hover:text-orange-200 transition duration-200 bg-orange-600 px-3 py-1 rounded-md">
+                            <i class="fas fa-home mr-1"></i>New Segment
+                        </a>
+                    {% endif %}
+                    <a href="{{ url_for('logout') }}" class="text-white hover:text-orange-200 transition duration-200">
+                        <i class="fas fa-sign-out-alt mr-1"></i>Logout
+                    </a>
+                {% endif %}
+            </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-7xl mx-auto py-6 px-4 sm:px-6 lg:px-8">
+        {% block content %}{% endblock %}
+    </main>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/axios/1.3.4/axios.min.js"></script>
+    <script src="{{ url_for('static', filename='js/preloader.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/segment-history.js') }}"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html> 

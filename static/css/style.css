@@ -1,0 +1,57 @@
+/* Custom styles for Strava Segment Analyzer */
+
+.stat-card {
+    @apply bg-gradient-to-r from-orange-400 to-orange-600 text-white p-4 rounded-lg shadow-lg;
+}
+
+.stat-value {
+    @apply text-2xl font-bold;
+}
+
+.stat-label {
+    @apply text-sm opacity-90;
+}
+
+.effort-row:hover {
+    @apply bg-orange-50 transition-colors duration-150;
+}
+
+.filter-active {
+    @apply bg-orange-100 border-orange-300;
+}
+
+.sort-asc::after {
+    content: "↑";
+    margin-left: 4px;
+}
+
+.sort-desc::after {
+    content: "↓";
+    margin-left: 4px;
+}
+
+/* Loading animation */
+@keyframes pulse {
+    0%, 100% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.5;
+    }
+}
+
+.pulse {
+    animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Responsive table */
+@media (max-width: 768px) {
+    .table-responsive {
+        font-size: 0.875rem;
+    }
+    
+    .table-responsive th,
+    .table-responsive td {
+        padding: 0.5rem 0.25rem;
+    }
+} 

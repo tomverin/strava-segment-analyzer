@@ -1,0 +1,306 @@
+{% extends "base.html" %}
+
+{% block title %}{{ segment.name }} - Strava Segment Analyzer{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+    <!-- Segment Header -->
+    <div class="bg-white rounded-lg shadow-md p-6">
+        <div class="flex items-center justify-between mb-4">
+            <div class="flex-1">
+                <div class="flex items-center gap-4 mb-2">
+                    <h1 class="text-3xl font-bold text-gray-900">{{ segment.name }}</h1>
+                    <a href="{{ url_for('index') }}" 
+                       class="inline-flex items-center px-3 py-1 bg-orange-500 text-white text-sm font-medium rounded-md hover:bg-orange-600 transition duration-200">
+                        <i class="fas fa-search mr-2"></i>Analyze Different Segment
+                    </a>
+                </div>
+                <p class="text-gray-600 mt-2">
+                    <i class="fas fa-route mr-2"></i>{{ "%.2f"|format(segment.distance / 1000) }} km 
+                    <span class="mx-2">•</span>
+                    <i class="fas fa-mountain mr-2"></i>{{ segment.total_elevation_gain }}m elevation gain
+                </p>
+                <p class="text-gray-500 text-sm mt-1">{{ segment.city }}, {{ segment.state }}</p>
+            </div>
+            <div class="text-right">
+                <p class="text-sm text-gray-500">Segment ID</p>
+                <p class="text-2xl font-bold text-orange-500">{{ segment.id }}</p>
+            </div>
+        </div>
+        
+        <!-- Recent Segments -->
+        <div id="recentSegmentsContainer" class="hidden">
+            <div class="border-t pt-4">
+                <h3 class="text-sm font-medium text-gray-700 mb-2">
+                    <i class="fas fa-history mr-1"></i>Recent Segments
+                </h3>
+                <div class="flex flex-wrap gap-2" id="recentSegmentsList">
+                    <!-- Recent segments will be populated by JavaScript -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Filters -->
+    <div class="bg-white rounded-lg shadow-md p-6">
+        <h2 class="text-xl font-semibold text-gray-900 mb-4">
+            <i class="fas fa-filter mr-2"></i>Filter Your Efforts
+        </h2>
+        
+        <!-- Filter Inputs -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+            <!-- Heart Rate Filter -->
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">
+                    Average Heart Rate (BPM)
+                </label>
+                <div class="flex space-x-2">
+                    <input 
+                        type="number" 
+                        id="minHeartRate" 
+                        placeholder="Min" 
+                        value="125"
+                        class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-orange-500"
+                    >
+                    <input 
+                        type="number" 
+                        id="maxHeartRate" 
+                        placeholder="Max" 
+                        value="140"
+                        class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-orange-500"
+                    >
+                </div>
+            </div>
+
+            <!-- Power Filter -->
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">
+                    Average Power (Watts)
+                </label>
+                <div class="flex space-x-2">
+                    <input 
+                        type="number" 
+                        id="minPower" 
+                        placeholder="Min" 
+                        value="200"
+                        class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-orange-500"
+                    >
+                    <input 
+                        type="number" 
+                        id="maxPower" 
+                        placeholder="Max" 
+                        value="350"
+                        class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-orange-500"
+                    >
+                </div>
+            </div>
+
+            <!-- Date Range Filter -->
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">
+                    Date Range
+                </label>
+                <div class="flex space-x-2">
+                    <input 
+                        type="date" 
+                        id="startDate" 
+                        value="2020-01-01"
+                        class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-orange-500"
+                    >
+                    <input 
+                        type="date" 
+                        id="endDate" 
+                        class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-orange-500"
+                    >
+                </div>
+            </div>
+        </div>
+
+        <!-- Filter Actions -->
+        <div class="flex flex-col sm:flex-row gap-3 justify-center">
+            <button 
+                id="applyFilters" 
+                class="bg-orange-500 text-white px-6 py-2 rounded-md hover:bg-orange-600 transition duration-200 font-medium"
+            >
+                <i class="fas fa-search mr-2"></i>Apply Filters
+            </button>
+            <button 
+                id="clearFilters" 
+                class="bg-gray-500 text-white px-6 py-2 rounded-md hover:bg-gray-600 transition duration-200 font-medium"
+            >
+                <i class="fas fa-times mr-2"></i>Clear Filters
+            </button>
+            <button 
+                id="resetDefaults" 
+                class="bg-blue-500 text-white px-6 py-2 rounded-md hover:bg-blue-600 transition duration-200 font-medium"
+            >
+                <i class="fas fa-undo mr-2"></i>Reset to Defaults
+            </button>
+        </div>
+    </div>
+
+    <!-- Loading Indicator -->
+    <div id="loadingIndicator" class="text-center py-8 hidden">
+        <div class="inline-flex items-center">
+            <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-orange-500"></div>
+            <span class="ml-3 text-gray-600">Loading your efforts...</span>
+        </div>
+    </div>
+    
+    <!-- Cache Info Banner -->
+    <div id="cacheInfoBanner" class="bg-green-50 border border-green-200 rounded-lg p-4 hidden">
+        <div class="flex items-center">
+            <div class="flex-shrink-0">
+                <i class="fas fa-bolt text-green-400"></i>
+            </div>
+            <div class="ml-3">
+                <h3 class="text-sm font-medium text-green-800">Instant Loading</h3>
+                <div class="mt-1 text-sm text-green-700">
+                    Data loaded from cache for instant display. Fresh data will load automatically.
+                </div>
+            </div>
+            <div class="ml-auto">
+                <button onclick="this.parentElement.parentElement.parentElement.classList.add('hidden')" 
+                        class="text-green-500 hover:text-green-700">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Fallback Mode Notice -->
+    <div id="fallbackNotice" class="bg-yellow-50 border border-yellow-200 rounded-lg p-4 hidden">
+        <div class="flex">
+            <div class="flex-shrink-0">
+                <i class="fas fa-exclamation-triangle text-yellow-400"></i>
+            </div>
+            <div class="ml-3">
+                <h3 class="text-sm font-medium text-yellow-800">Fallback Mode Active</h3>
+                <div class="mt-2 text-sm text-yellow-700">
+                    Heart rate data is showing activity-level averages instead of segment-specific values due to API rate limits.
+                    Wait a few minutes before refreshing to get segment-specific heart rate data.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Cache Status Panel -->
+    <div class="bg-white rounded-lg shadow-md p-6">
+        <div class="flex items-center justify-between mb-4">
+            <h2 class="text-xl font-semibold text-gray-900">
+                <i class="fas fa-database mr-2"></i>Cache Status
+            </h2>
+            <button 
+                id="clearCacheBtn" 
+                class="bg-red-500 text-white px-3 py-1 rounded-md hover:bg-red-600 transition duration-200 text-sm"
+            >
+                <i class="fas fa-trash mr-1"></i>Clear Expired
+            </button>
+        </div>
+        
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4" id="cacheStats">
+            <div class="text-center">
+                <div class="text-2xl font-bold text-blue-600" id="totalFiles">-</div>
+                <div class="text-sm text-gray-500">Total Files</div>
+            </div>
+            <div class="text-center">
+                <div class="text-2xl font-bold text-green-600" id="totalSize">-</div>
+                <div class="text-sm text-gray-500">Cache Size</div>
+            </div>
+            <div class="text-center">
+                <div class="text-2xl font-bold text-purple-600" id="segmentCount">-</div>
+                <div class="text-sm text-gray-500">Segments</div>
+            </div>
+            <div class="text-center">
+                <div class="text-2xl font-bold text-orange-600" id="activityCount">-</div>
+                <div class="text-sm text-gray-500">Activities</div>
+            </div>
+        </div>
+        
+        <div class="mt-4 text-xs text-gray-500">
+            <i class="fas fa-info-circle mr-1"></i>
+            Cache reduces API calls: Segments (24h), Activities & Streams (7 days), Efforts (1h)
+        </div>
+    </div>
+
+    <!-- Statistics Summary -->
+    <div id="statisticsPanel" class="bg-white rounded-lg shadow-md p-6 hidden">
+        <h2 class="text-xl font-semibold text-gray-900 mb-4">
+            <i class="fas fa-chart-bar mr-2"></i>Statistics
+        </h2>
+        <div class="grid grid-cols-2 md:grid-cols-6 gap-4" id="statsContent">
+            <!-- Statistics will be populated by JavaScript -->
+        </div>
+    </div>
+
+    <!-- Efforts List -->
+    <div id="effortsPanel" class="bg-white rounded-lg shadow-md hidden">
+        <div class="p-6 border-b border-gray-200">
+            <h2 class="text-xl font-semibold text-gray-900">
+                <i class="fas fa-list mr-2"></i>Your Efforts
+                <span id="effortsCount" class="text-sm text-gray-500 font-normal ml-2"></span>
+            </h2>
+        </div>
+        
+        <div class="overflow-x-auto">
+            <table class="min-w-full divide-y divide-gray-200" id="effortsTable">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100" data-sort="start_date">
+                            Date <i class="fas fa-sort ml-1"></i>
+                        </th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                            Activity
+                        </th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100" data-sort="elapsed_time">
+                            Time <i class="fas fa-sort ml-1"></i>
+                        </th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100" data-sort="average_heartrate">
+                            Avg HR <i class="fas fa-sort ml-1"></i>
+                        </th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100" data-sort="max_heartrate">
+                            Max HR <i class="fas fa-sort ml-1"></i>
+                        </th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100" data-sort="average_watts">
+                            Avg Power <i class="fas fa-sort ml-1"></i>
+                        </th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100" data-sort="vam">
+                            VAM <i class="fas fa-sort ml-1"></i>
+                        </th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                            Actions
+                        </th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white divide-y divide-gray-200" id="effortsTableBody">
+                    <!-- Efforts will be populated by JavaScript -->
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Error Panel -->
+    <div id="errorPanel" class="bg-red-50 border border-red-200 rounded-lg p-4 hidden">
+        <div class="flex">
+            <div class="flex-shrink-0">
+                <i class="fas fa-exclamation-circle text-red-400"></i>
+            </div>
+            <div class="ml-3">
+                <h3 class="text-sm font-medium text-red-800">Error Loading Efforts</h3>
+                <div class="mt-2 text-sm text-red-700" id="errorMessage">
+                    <!-- Error message will be populated by JavaScript -->
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+// Pass segment data to JavaScript
+window.segmentData = {{ segment | tojson }};
+</script>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/segment-analyzer.js') }}"></script>
+{% endblock %} 
