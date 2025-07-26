@@ -110,6 +110,12 @@ def logout():
     session.clear()
     return redirect(url_for('login'))
 
+def add_cache_headers(response, max_age=31536000):  # 1 year in seconds
+    """Add cache control headers to response"""
+    response.headers['Cache-Control'] = f'public, max-age={max_age}'
+    response.headers['Vary'] = 'Accept-Encoding'
+    return response
+
 @app.route('/segment/<int:segment_id>/efforts')
 def get_segment_efforts(segment_id):
     """Get all efforts for a specific segment"""
@@ -157,13 +163,33 @@ def get_segment_efforts(segment_id):
             'per_page': 200  # Maximum allowed
         }
         
-        logger.info(f"Fetching efforts from: {efforts_url} with params: {params}")
-        response = requests.get(efforts_url, headers=headers, params=params)
-        logger.info(f"Efforts API response: {response.status_code}")
+        logger.info(f"Fetching efforts from: {efforts_url}")
+        logger.info(f"Headers: {headers}")
+        logger.info(f"Params: {params}")
         
-        if response.status_code != 200:
-            logger.error(f"Failed to fetch efforts: {response.status_code} - {response.text}")
-            return jsonify({'error': f'Failed to fetch efforts: {response.text}'}), 400
+        try:
+            response = requests.get(efforts_url, headers=headers, params=params)
+            logger.info(f"Efforts API response: {response.status_code}")
+            logger.info(f"Response content: {response.text}")
+            
+            if response.status_code == 401:
+                logger.error("Authentication failed - token might be expired")
+                session.clear()  # Clear invalid session
+                return jsonify({
+                    'error': 'Your Strava authentication has expired. Please refresh the page to login again.',
+                    'needs_reauth': True
+                }), 401
+            
+            if response.status_code != 200:
+                error_message = response.json() if response.text else "Unknown error"
+                logger.error(f"Failed to fetch efforts: {response.status_code} - {error_message}")
+                return jsonify({'error': f'Failed to fetch efforts: {error_message}'}), response.status_code
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed: {str(e)}")
+            return jsonify({'error': 'Failed to connect to Strava API'}), 500
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse response: {str(e)}")
+            return jsonify({'error': 'Invalid response from Strava API'}), 500
         
         efforts = response.json()
         logger.info(f"Found {len(efforts)} efforts")
@@ -252,7 +278,8 @@ def get_segment_efforts(segment_id):
             detailed_efforts.append(effort_detail)
 
     logger.info(f"Returning {len(detailed_efforts)} detailed efforts")
-    return jsonify(detailed_efforts)
+    response = jsonify(detailed_efforts)
+    return add_cache_headers(response)
 
 def get_segment_heart_rate_from_streams(activity_id, effort, headers):
     """Get heart rate data specific to the segment effort"""
@@ -362,12 +389,12 @@ def cache_stats():
 
 @app.route('/cache/clear', methods=['POST'])
 def clear_cache():
-    """Clear expired cache entries"""
+    """Clear all cache entries"""
     if 'access_token' not in session:
         return jsonify({'error': 'Not authenticated'}), 401
     
-    cache.clear_expired()
-    return jsonify({'message': 'Expired cache entries cleared'})
+    cache.clear_all()
+    return jsonify({'message': 'All cache entries cleared'})
 
 @app.route('/health')
 def health_check():

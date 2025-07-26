@@ -116,13 +116,16 @@ class SegmentAnalyzer {
                 showNotification('Could not refresh data, showing cached version', 'warning');
             } else {
                 // No cached data, show error normally
-                if (error.response?.status === 429 && !this.fallbackMode) {
-                    this.fallbackMode = true;
-                    showNotification('Rate limit exceeded. Switching to fallback mode (activity-level heart rate).', 'warning');
-                    setTimeout(() => this.loadEfforts(), 2000);
-                } else {
-                    this.showError(error.response?.data?.error || 'Failed to load segment efforts');
-                }
+                            if (error.response?.status === 401 && error.response?.data?.needs_reauth) {
+                showNotification('Session expired. Redirecting to login...', 'warning');
+                setTimeout(() => window.location.reload(), 2000);
+            } else if (error.response?.status === 429 && !this.fallbackMode) {
+                this.fallbackMode = true;
+                showNotification('Rate limit exceeded. Switching to fallback mode (activity-level heart rate).', 'warning');
+                setTimeout(() => this.loadEfforts(), 2000);
+            } else {
+                this.showError(error.response?.data?.error || 'Failed to load segment efforts');
+            }
             }
         } finally {
             loadingIndicator.classList.add('hidden');
@@ -464,6 +467,28 @@ class SegmentAnalyzer {
                 timestamp: new Date().toISOString()
             };
             localStorage.setItem(cacheKey, JSON.stringify(cacheData));
+            
+            // Store individual efforts in IndexedDB for permanent storage
+            if (window.indexedDB) {
+                const request = indexedDB.open('stravaCache', 1);
+                
+                request.onupgradeneeded = (event) => {
+                    const db = event.target.result;
+                    if (!db.objectStoreNames.contains('efforts')) {
+                        db.createObjectStore('efforts', { keyPath: 'id' });
+                    }
+                };
+                
+                request.onsuccess = (event) => {
+                    const db = event.target.result;
+                    const transaction = db.transaction(['efforts'], 'readwrite');
+                    const store = transaction.objectStore('efforts');
+                    
+                    efforts.forEach(effort => {
+                        store.put(effort);
+                    });
+                };
+            }
         } catch (error) {
             console.warn('Error caching efforts:', error);
         }

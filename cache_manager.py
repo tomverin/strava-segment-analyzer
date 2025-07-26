@@ -5,36 +5,19 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 class StravaCache:
-    """File-based cache for Strava API data with TTL support"""
+    """File-based cache for Strava API data with no expiration"""
     
     def __init__(self, cache_dir="cache"):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
-        
-        # Cache TTL settings (in seconds)
-        self.ttl_settings = {
-            'segment': 24 * 60 * 60,      # 24 hours - segments rarely change
-            'activity': 7 * 24 * 60 * 60,  # 7 days - activities don't change
-            'streams': 7 * 24 * 60 * 60,   # 7 days - heart rate data doesn't change
-            'efforts': 60 * 60             # 1 hour - efforts can have new ones added
-        }
     
     def _get_cache_path(self, cache_type, key):
         """Get the file path for a cache entry"""
         filename = f"{cache_type}_{key}.json"
         return self.cache_dir / filename
     
-    def _is_expired(self, cache_data, cache_type):
-        """Check if cache entry has expired"""
-        if 'timestamp' not in cache_data:
-            return True
-        
-        ttl = self.ttl_settings.get(cache_type, 3600)  # Default 1 hour
-        age = time.time() - cache_data['timestamp']
-        return age > ttl
-    
     def get(self, cache_type, key):
-        """Get data from cache if exists and not expired"""
+        """Get data from cache if exists"""
         try:
             cache_path = self._get_cache_path(cache_type, key)
             if not cache_path.exists():
@@ -42,11 +25,6 @@ class StravaCache:
             
             with open(cache_path, 'r') as f:
                 cache_data = json.load(f)
-            
-            if self._is_expired(cache_data, cache_type):
-                # Remove expired cache file
-                cache_path.unlink()
-                return None
             
             return cache_data['data']
         
@@ -79,24 +57,14 @@ class StravaCache:
         except OSError:
             pass
     
-    def clear_expired(self):
-        """Clear all expired cache entries"""
+    def clear_all(self):
+        """Clear all cache entries"""
         try:
             for cache_file in self.cache_dir.glob("*.json"):
                 try:
-                    with open(cache_file, 'r') as f:
-                        cache_data = json.load(f)
-                    
-                    # Extract cache type from filename
-                    cache_type = cache_file.stem.split('_')[0]
-                    
-                    if self._is_expired(cache_data, cache_type):
-                        cache_file.unlink()
-                
-                except (json.JSONDecodeError, KeyError, OSError):
-                    # If we can't read the file, delete it
                     cache_file.unlink()
-        
+                except OSError:
+                    pass
         except OSError:
             pass
     
@@ -105,10 +73,15 @@ class StravaCache:
         stats = {
             'total_files': 0,
             'by_type': {},
-            'total_size': 0
+            'total_size': 0,
+            'oldest_entry': None,
+            'newest_entry': None
         }
         
         try:
+            oldest_time = float('inf')
+            newest_time = 0
+            
             for cache_file in self.cache_dir.glob("*.json"):
                 stats['total_files'] += 1
                 stats['total_size'] += cache_file.stat().st_size
@@ -116,6 +89,19 @@ class StravaCache:
                 # Extract cache type from filename
                 cache_type = cache_file.stem.split('_')[0]
                 stats['by_type'][cache_type] = stats['by_type'].get(cache_type, 0) + 1
+                
+                try:
+                    with open(cache_file, 'r') as f:
+                        data = json.load(f)
+                        timestamp = data.get('timestamp', 0)
+                        if timestamp < oldest_time:
+                            oldest_time = timestamp
+                            stats['oldest_entry'] = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+                        if timestamp > newest_time:
+                            newest_time = timestamp
+                            stats['newest_entry'] = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+                except (json.JSONDecodeError, KeyError, OSError):
+                    pass
         
         except OSError:
             pass
