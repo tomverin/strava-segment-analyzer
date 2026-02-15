@@ -1,25 +1,138 @@
-/* Custom styles for Strava Segment Analyzer */
-
-.stat-card {
-    @apply bg-gradient-to-r from-orange-400 to-orange-600 text-white p-4 rounded-lg shadow-lg;
+:root {
+    --strava-orange: #fc4c02;
+    --strava-orange-dark: #d94308;
+    --strava-text: #242428;
+    --strava-muted: #6b7280;
+    --strava-border: #e6e7eb;
+    --strava-bg: #f7f8fa;
+    --strava-card: #ffffff;
 }
 
-.stat-value {
-    @apply text-2xl font-bold;
+html,
+body {
+    background: var(--strava-bg);
+    color: var(--strava-text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
 
-.stat-label {
-    @apply text-sm opacity-90;
+/* Top navigation */
+.topbar {
+    background: #fff;
+    border-bottom: 1px solid var(--strava-border);
+    box-shadow: 0 1px 0 rgba(0, 0, 0, 0.02);
 }
 
-.effort-row:hover {
-    @apply bg-orange-50 transition-colors duration-150;
+.topbar-brand {
+    color: var(--strava-orange);
+    font-weight: 800;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+}
+
+.topbar-link {
+    color: var(--strava-orange);
+    font-weight: 600;
+}
+
+.topbar-link:hover {
+    color: var(--strava-orange-dark);
+}
+
+/* Cards */
+.bg-white.rounded-lg.shadow-md,
+.bg-white.rounded-lg.shadow,
+.bg-white.shadow-md,
+.bg-white.shadow {
+    background: var(--strava-card) !important;
+    border: 1px solid var(--strava-border);
+    border-radius: 12px !important;
+    box-shadow: 0 6px 20px rgba(15, 23, 42, 0.05) !important;
+}
+
+/* Buttons */
+.bg-orange-500 {
+    background-color: var(--strava-orange) !important;
+}
+
+.bg-orange-500:hover,
+.hover\:bg-orange-600:hover {
+    background-color: var(--strava-orange-dark) !important;
+}
+
+.bg-blue-500 {
+    background-color: var(--strava-orange) !important;
+}
+
+.bg-blue-500:hover,
+.hover\:bg-blue-600:hover {
+    background-color: var(--strava-orange-dark) !important;
+}
+
+.text-orange-500,
+.text-orange-600 {
+    color: var(--strava-orange) !important;
+}
+
+/* Inputs + selects */
+input,
+select {
+    border-color: #d3d6dd !important;
+    background: #fff;
+    color: var(--strava-text);
+}
+
+input:focus,
+select:focus {
+    outline: none !important;
+    border-color: var(--strava-orange) !important;
+    box-shadow: 0 0 0 2px rgba(252, 76, 2, 0.14) !important;
 }
 
 .filter-active {
-    @apply bg-orange-100 border-orange-300;
+    background: #fff4ef !important;
+    border-color: #fcb79a !important;
 }
 
+/* Statistics cards */
+.stat-card {
+    background: #ffffff;
+    color: var(--strava-text);
+    padding: 14px;
+    border-radius: 10px;
+    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
+    border: 1px solid var(--strava-border);
+}
+
+.stat-value {
+    font-size: 2.2rem;
+    line-height: 1.1;
+    font-weight: 800;
+    color: #111827;
+}
+
+.stat-label {
+    font-size: 0.9rem;
+    color: #6b7280;
+    opacity: 1;
+}
+
+/* Table */
+#effortsTable thead {
+    background: #f9fafb;
+}
+
+#effortsTable th {
+    color: #6b7280;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+}
+
+.effort-row:hover {
+    background: #fff7f2;
+    transition: background-color 0.15s ease;
+}
+
+/* Sort arrows */
 .sort-asc::after {
     content: "↑";
     margin-left: 4px;
@@ -30,28 +143,25 @@
     margin-left: 4px;
 }
 
-/* Loading animation */
-@keyframes pulse {
-    0%, 100% {
-        opacity: 1;
-    }
-    50% {
-        opacity: 0.5;
-    }
+/* Notifications / banners harmony */
+#cacheInfoBanner {
+    border-color: #ffd7c3;
+    background: #fff4ee;
 }
 
-.pulse {
-    animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+#fallbackNotice {
+    border-color: #ffe2a8;
+    background: #fff9ea;
 }
 
-/* Responsive table */
+/* Mobile */
 @media (max-width: 768px) {
     .table-responsive {
         font-size: 0.875rem;
     }
-    
+
     .table-responsive th,
     .table-responsive td {
         padding: 0.5rem 0.25rem;
     }
-} 
+}

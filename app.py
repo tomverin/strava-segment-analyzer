@@ -1,428 +1,786 @@
-from flask import Flask, render_template, request, redirect, url_for, session, jsonify
-import os
-import requests
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
-import json
-import time
 import logging
-from cache_manager import cache
+import os
+import time
+from typing import Dict, List, Tuple
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import requests
+from dotenv import load_dotenv
+from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+
+from storage import StravaRepository
+
 
 load_dotenv()
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
-app.secret_key = os.getenv('SECRET_KEY', 'fallback-secret-key-for-cloud-deployment')
+app.secret_key = os.getenv("SECRET_KEY", "fallback-secret-key-for-cloud-deployment")
 
-# Strava API configuration
-STRAVA_CLIENT_ID = os.getenv('STRAVA_CLIENT_ID')
-STRAVA_CLIENT_SECRET = os.getenv('STRAVA_CLIENT_SECRET')
-STRAVA_REDIRECT_URI = os.getenv('STRAVA_REDIRECT_URI', 'http://localhost:8000/auth/callback')
+STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
+STRAVA_CLIENT_SECRET = os.getenv("STRAVA_CLIENT_SECRET")
+STRAVA_REDIRECT_URI = os.getenv("STRAVA_REDIRECT_URI", "http://localhost:8000/auth/callback")
+STRAVA_API_BASE = "https://www.strava.com/api/v3"
+STRAVA_AUTH_URL = "https://www.strava.com/oauth/authorize"
+STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
+RECENT_REFRESH_PAGES = max(1, int(os.getenv("RECENT_REFRESH_PAGES", "2")))
+BACKFILL_PAGES_PER_RUN = max(1, int(os.getenv("BACKFILL_PAGES_PER_RUN", "25")))
+MAX_ACTIVITY_FETCHES_PER_PAGE = max(1, int(os.getenv("MAX_ACTIVITY_FETCHES_PER_PAGE", "25")))
+RATE_LIMIT_COOLDOWN_SECONDS = max(60, int(os.getenv("RATE_LIMIT_COOLDOWN_SECONDS", "900")))
+MAX_MISSING_BIKE_REFRESH_PER_RUN = max(1, int(os.getenv("MAX_MISSING_BIKE_REFRESH_PER_RUN", "40")))
 
-logger.info(f"App starting...")
-logger.info(f"STRAVA_CLIENT_ID: {'SET' if STRAVA_CLIENT_ID else 'NOT SET'}")
-logger.info(f"STRAVA_CLIENT_SECRET: {'SET' if STRAVA_CLIENT_SECRET else 'NOT SET'}")
-logger.info(f"STRAVA_REDIRECT_URI: {STRAVA_REDIRECT_URI}")
+repository = StravaRepository(os.getenv("STRAVA_DB_PATH", "data/strava.db"))
+rate_limit_cooldowns: Dict[str, float] = {}
+logger.info(
+    "Sync config db_path=%s recent_refresh_pages=%s backfill_pages_per_run=%s max_activity_fetches_per_page=%s max_missing_bike_refresh_per_run=%s rate_limit_cooldown_seconds=%s",
+    repository.db_path,
+    RECENT_REFRESH_PAGES,
+    BACKFILL_PAGES_PER_RUN,
+    MAX_ACTIVITY_FETCHES_PER_PAGE,
+    MAX_MISSING_BIKE_REFRESH_PER_RUN,
+    RATE_LIMIT_COOLDOWN_SECONDS,
+)
 
-# Ensure cache directory exists
-try:
-    os.makedirs('cache', exist_ok=True)
-    logger.info("Cache directory verified")
-except Exception as e:
-    logger.warning(f"Could not create cache directory: {e}")
 
-# Strava API endpoints
-STRAVA_AUTH_URL = 'https://www.strava.com/oauth/authorize'
-STRAVA_TOKEN_URL = 'https://www.strava.com/oauth/token'
-STRAVA_API_BASE = 'https://www.strava.com/api/v3'
+class StravaAPIError(Exception):
+    def __init__(self, status_code: int, message: str):
+        self.status_code = status_code
+        self.message = message
+        super().__init__(message)
 
-@app.route('/')
-def index():
-    """Main page - check if user is authenticated"""
-    logger.info(f"Index route accessed. Session has access_token: {'access_token' in session}")
-    if 'access_token' not in session:
-        return redirect(url_for('login'))
-    return render_template('index.html')
 
-@app.route('/login')
-def login():
-    """Redirect to Strava OAuth login"""
-    logger.info("Login route accessed")
-    
-    if not STRAVA_CLIENT_ID:
-        logger.error("STRAVA_CLIENT_ID not configured")
-        return "Configuration Error: STRAVA_CLIENT_ID not set. Please check environment variables.", 500
-    
-    auth_url = f"{STRAVA_AUTH_URL}?client_id={STRAVA_CLIENT_ID}&response_type=code&redirect_uri={STRAVA_REDIRECT_URI}&approval_prompt=force&scope=read,activity:read_all"
-    logger.info(f"Redirecting to: {auth_url}")
-    return redirect(auth_url)
+def normalize_athlete_id(value):
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
-@app.route('/auth/callback')
-def auth_callback():
-    """Handle Strava OAuth callback"""
-    code = request.args.get('code')
-    error = request.args.get('error')
-    
-    logger.info(f"Auth callback received. Code: {'SET' if code else 'NOT SET'}, Error: {error}")
-    
-    if error:
-        logger.error(f"OAuth error: {error}")
-        return f"Authorization failed: {error}", 400
-        
-    if not code:
-        logger.error("No authorization code received")
-        return "Authorization failed - no code received", 400
-    
-    if not STRAVA_CLIENT_ID or not STRAVA_CLIENT_SECRET:
-        logger.error("Strava credentials not configured")
-        return "Configuration Error: Strava API credentials not set. Please check environment variables.", 500
-    
-    # Exchange code for access token
-    token_data = {
-        'client_id': STRAVA_CLIENT_ID,
-        'client_secret': STRAVA_CLIENT_SECRET,
-        'code': code,
-        'grant_type': 'authorization_code'
-    }
-    
-    logger.info("Exchanging code for access token...")
-    response = requests.post(STRAVA_TOKEN_URL, data=token_data)
-    logger.info(f"Token exchange response status: {response.status_code}")
-    
-    if response.status_code == 200:
-        token_info = response.json()
-        session['access_token'] = token_info['access_token']
-        session['refresh_token'] = token_info['refresh_token']
-        session['athlete_id'] = token_info['athlete']['id']
-        logger.info(f"Successfully authenticated athlete: {token_info['athlete']['id']}")
-        return redirect(url_for('index'))
-    else:
-        logger.error(f"Token exchange failed: {response.status_code} - {response.text}")
-        return f"Token exchange failed: {response.text}", 400
 
-@app.route('/logout')
-def logout():
-    """Clear session and logout"""
-    logger.info("User logging out")
-    session.clear()
-    return redirect(url_for('login'))
+def cooldown_key(segment_id: int, athlete_id: int) -> str:
+    return f"{segment_id}:{athlete_id}"
 
-def add_cache_headers(response, max_age=31536000):  # 1 year in seconds
-    """Add cache control headers to response"""
-    response.headers['Cache-Control'] = f'public, max-age={max_age}'
-    response.headers['Vary'] = 'Accept-Encoding'
+
+def get_cooldown_remaining_seconds(segment_id: int, athlete_id: int) -> int:
+    key = cooldown_key(segment_id, athlete_id)
+    until = rate_limit_cooldowns.get(key, 0)
+    remaining = int(until - time.time())
+    return max(0, remaining)
+
+
+def set_rate_limit_cooldown(segment_id: int, athlete_id: int) -> None:
+    key = cooldown_key(segment_id, athlete_id)
+    rate_limit_cooldowns[key] = time.time() + RATE_LIMIT_COOLDOWN_SECONDS
+    logger.warning(
+        "Set rate-limit cooldown segment=%s athlete=%s for %ss",
+        segment_id,
+        athlete_id,
+        RATE_LIMIT_COOLDOWN_SECONDS,
+    )
+
+
+def add_cache_headers(response, max_age=300):
+    response.headers["Cache-Control"] = f"private, max-age={max_age}"
+    response.headers["Vary"] = "Accept-Encoding"
     return response
 
-@app.route('/segment/<int:segment_id>/efforts')
-def get_segment_efforts(segment_id):
-    """Get all efforts for a specific segment"""
-    logger.info(f"Getting efforts for segment {segment_id}")
-    
-    if 'access_token' not in session:
-        logger.warning("No access token in session")
-        return jsonify({'error': 'Not authenticated'}), 401
-    
-    access_token = session['access_token']
-    athlete_id = session['athlete_id']
-    
-    logger.info(f"User authenticated: athlete_id={athlete_id}")
-    
-    # Check for fallback mode (skip heart rate streams to avoid rate limits)
-    fallback_mode = request.args.get('fallback', 'false').lower() == 'true'
-    logger.info(f"Fallback mode: {fallback_mode}")
-    
-    # Get segment info for VAM calculation
-    segment_info = cache.get('segment', str(segment_id))
-    if segment_info is None:
-        headers = {'Authorization': f'Bearer {access_token}'}
-        segment_url = f"{STRAVA_API_BASE}/segments/{segment_id}"
-        logger.info(f"Fetching segment info from: {segment_url}")
-        segment_response = requests.get(segment_url, headers=headers)
-        logger.info(f"Segment API response: {segment_response.status_code}")
-        if segment_response.status_code == 200:
-            segment_info = segment_response.json()
-            cache.set('segment', str(segment_id), segment_info)
-        else:
-            logger.error(f"Failed to fetch segment info: {segment_response.status_code} - {segment_response.text}")
-            return jsonify({'error': f'Failed to fetch segment info: {segment_response.text}'}), 400
-    
-    # Check cache for segment efforts first (shorter TTL as new efforts can be added)
-    efforts_cache_key = f"{segment_id}_{athlete_id}"
-    efforts = cache.get('efforts', efforts_cache_key)
-    
-    if efforts is None:
-        # Get segment efforts from API
-        efforts_url = f"{STRAVA_API_BASE}/segment_efforts"
-        headers = {'Authorization': f'Bearer {access_token}'}
-        params = {
-            'segment_id': segment_id,
-            'athlete_id': athlete_id,
-            'per_page': 200  # Maximum allowed
-        }
-        
-        logger.info(f"Fetching efforts from: {efforts_url}")
-        logger.info(f"Headers: {headers}")
-        logger.info(f"Params: {params}")
-        
-        try:
-            response = requests.get(efforts_url, headers=headers, params=params)
-            logger.info(f"Efforts API response: {response.status_code}")
-            logger.info(f"Response content: {response.text}")
-            
-            if response.status_code == 401:
-                logger.error("Authentication failed - token might be expired")
-                session.clear()  # Clear invalid session
-                return jsonify({
-                    'error': 'Your Strava authentication has expired. Please refresh the page to login again.',
-                    'needs_reauth': True
-                }), 401
-            
-            if response.status_code != 200:
-                error_message = response.json() if response.text else "Unknown error"
-                logger.error(f"Failed to fetch efforts: {response.status_code} - {error_message}")
-                return jsonify({'error': f'Failed to fetch efforts: {error_message}'}), response.status_code
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request failed: {str(e)}")
-            return jsonify({'error': 'Failed to connect to Strava API'}), 500
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse response: {str(e)}")
-            return jsonify({'error': 'Invalid response from Strava API'}), 500
-        
-        efforts = response.json()
-        logger.info(f"Found {len(efforts)} efforts")
-        # Cache efforts for 1 hour (new efforts might be added)
-        cache.set('efforts', efforts_cache_key, efforts)
-    else:
-        logger.info(f"Using cached efforts: {len(efforts)} efforts")
-    
-    headers = {'Authorization': f'Bearer {access_token}'}
-    
-    # Get detailed activity data for each effort to include heart rate
-    detailed_efforts = []
-    for i, effort in enumerate(efforts):
-        # Add delay between requests to avoid rate limiting
-        if i > 0:
-            time.sleep(0.5)  # 500ms delay between requests
-            
-        activity_id = effort['activity']['id']
-        
-        # Check cache for activity data first
-        activity_data = cache.get('activity', str(activity_id))
-        
-        if activity_data is None:
-            activity_url = f"{STRAVA_API_BASE}/activities/{activity_id}"
-            activity_response = requests.get(activity_url, headers=headers)
-            
-            if activity_response.status_code == 200:
-                activity_data = activity_response.json()
-                # Cache activity data for 7 days (activities don't change)
-                cache.set('activity', str(activity_id), activity_data)
-            elif activity_response.status_code == 429:
-                # Rate limit hit - return what we have so far
-                logger.warning(f"Rate limit hit after processing {i} efforts")
-                break
-            else:
-                logger.warning(f"Failed to get activity {activity_id}: {activity_response.status_code}")
-                continue  # Skip this effort if we can't get activity data
-        
-        if activity_data:
-            
-            # Get segment-specific heart rate data
-            # First try to use the heart rate data directly from the segment effort
-            effort_avg_hr = effort.get('average_heartrate')
-            effort_max_hr = effort.get('max_heartrate')
-            
-            if effort_avg_hr is not None and effort_max_hr is not None:
-                # Use the segment effort's heart rate data (most accurate)
-                segment_hr_data = {
-                    'average_heartrate': effort_avg_hr,
-                    'max_heartrate': effort_max_hr
-                }
-            elif not fallback_mode:
-                # Try to calculate from streams using start/end indices
-                segment_hr_data = get_segment_heart_rate_from_streams(activity_id, effort, headers)
-            else:
-                # Fallback to activity-level heart rate
-                segment_hr_data = {
-                    'average_heartrate': activity_data.get('average_heartrate'),
-                    'max_heartrate': activity_data.get('max_heartrate')
-                }
-            
-            # Calculate VAM (Vertical Ascent Meters per hour)
-            vam = None
-            elevation_gain = segment_info.get('total_elevation_gain', 0)
-            elapsed_time = effort.get('elapsed_time', 0)
-            if elevation_gain and elapsed_time:
-                # VAM = (elevation gain in meters / time in seconds) * 3600 (to get meters/hour)
-                vam = round((elevation_gain / elapsed_time) * 3600, 0)
-            
-            # Get average power from effort
-            average_watts = effort.get('average_watts')
-            
-            effort_detail = {
-                'id': effort['id'],
-                'start_date': effort['start_date'],
-                'elapsed_time': effort['elapsed_time'],
-                'moving_time': effort.get('moving_time', effort['elapsed_time']),
-                'distance': effort.get('distance', 0),
-                'average_heartrate': segment_hr_data['average_heartrate'],
-                'max_heartrate': segment_hr_data['max_heartrate'],
-                'average_watts': average_watts,
-                'vam': vam,
-                'name': activity_data.get('name', 'Untitled'),
-                'activity_id': activity_id
-            }
-            detailed_efforts.append(effort_detail)
 
-    logger.info(f"Returning {len(detailed_efforts)} detailed efforts")
-    response = jsonify(detailed_efforts)
-    return add_cache_headers(response)
+def refresh_access_token() -> bool:
+    logger.info("Refreshing Strava access token")
+    refresh_token = session.get("refresh_token")
+    if not refresh_token or not STRAVA_CLIENT_ID or not STRAVA_CLIENT_SECRET:
+        logger.warning("Cannot refresh token: missing refresh token or client credentials")
+        return False
 
-def get_segment_heart_rate_from_streams(activity_id, effort, headers):
-    """Get heart rate data specific to the segment effort"""
+    payload = {
+        "client_id": STRAVA_CLIENT_ID,
+        "client_secret": STRAVA_CLIENT_SECRET,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
+
+    response = requests.post(STRAVA_TOKEN_URL, data=payload, timeout=20)
+    if response.status_code != 200:
+        logger.warning("Failed refreshing token: %s", response.text)
+        return False
+
+    token_info = response.json()
+    if "access_token" not in token_info or "refresh_token" not in token_info:
+        logger.warning("Refresh response missing token fields: %s", token_info)
+        return False
+
+    session["access_token"] = token_info["access_token"]
+    session["refresh_token"] = token_info["refresh_token"]
+
+    athlete = token_info.get("athlete")
+    if isinstance(athlete, dict) and athlete.get("id"):
+        session["athlete_id"] = athlete["id"]
+        logger.info("Access token refreshed successfully for athlete=%s", session["athlete_id"])
+        return True
+
+    # Some refresh responses may not include athlete details.
+    if session.get("athlete_id"):
+        logger.info("Access token refreshed; reusing athlete_id from session=%s", session["athlete_id"])
+        return True
+
     try:
-        # Check cache for streams data first
-        streams_data = cache.get('streams', str(activity_id))
-        
-        if streams_data is None:
-            # Add small delay before streams request
-            time.sleep(0.3)
-            
-            # Get activity streams (heart rate and time data)
-            streams_url = f"{STRAVA_API_BASE}/activities/{activity_id}/streams"
-            params = {
-                'keys': 'heartrate,time',
-                'key_by_type': 'true'
-            }
-            
-            streams_response = requests.get(streams_url, headers=headers, params=params)
-            if streams_response.status_code == 429:
-                print(f"Rate limit hit getting streams for activity {activity_id}")
-                return {'average_heartrate': None, 'max_heartrate': None}
-            elif streams_response.status_code != 200:
-                return {'average_heartrate': None, 'max_heartrate': None}
-            
-            streams_data = streams_response.json()
-            # Cache streams data for 7 days (heart rate data doesn't change)
-            cache.set('streams', str(activity_id), streams_data)
-        
-        # Check if heart rate data is available
-        if 'heartrate' not in streams_data or 'time' not in streams_data:
-            return {'average_heartrate': None, 'max_heartrate': None}
-        
-        heartrate_stream = streams_data['heartrate']['data']
-        time_stream = streams_data['time']['data']
-        
-        # Parse effort start time and calculate segment window
-        from datetime import datetime
-        
-        # Use start_index and end_index if available (more accurate than time-based calculation)
-        start_index = effort.get('start_index')
-        end_index = effort.get('end_index')
-        
-        if start_index is not None and end_index is not None:
-            # Use indices to extract segment-specific heart rate data
-            try:
-                segment_hr_values = []
-                for i in range(start_index, min(end_index + 1, len(heartrate_stream))):
-                    if i < len(heartrate_stream) and heartrate_stream[i] is not None:
-                        segment_hr_values.append(heartrate_stream[i])
-                
-                if segment_hr_values:
-                    avg_hr = sum(segment_hr_values) / len(segment_hr_values)
-                    max_hr = max(segment_hr_values)
-                    return {
-                        'average_heartrate': round(avg_hr, 1),
-                        'max_heartrate': max_hr
-                    }
-                else:
-                    return {'average_heartrate': None, 'max_heartrate': None}
-                    
-            except (ValueError, TypeError) as e:
-                print(f"Error using stream indices {start_index}-{end_index}: {e}")
-                return {'average_heartrate': None, 'max_heartrate': None}
+        headers = {"Authorization": f"Bearer {session['access_token']}"}
+        athlete_response = requests.get(
+            f"{STRAVA_API_BASE}/athlete", headers=headers, timeout=20
+        )
+        if athlete_response.status_code == 200:
+            athlete_data = athlete_response.json()
+            athlete_id = athlete_data.get("id")
+            if athlete_id:
+                session["athlete_id"] = athlete_id
+                logger.info("Access token refreshed; athlete_id loaded from /athlete=%s", athlete_id)
+                return True
+        logger.warning(
+            "Unable to resolve athlete_id after token refresh: %s",
+            athlete_response.text,
+        )
+    except requests.exceptions.RequestException as exc:
+        logger.warning("Failed to fetch athlete profile after refresh: %s", exc)
+        return False
+
+    return False
+
+
+def strava_get(path: str, params: Dict | None = None, retry_on_auth=True):
+    if "access_token" not in session:
+        raise StravaAPIError(401, "Not authenticated")
+
+    headers = {"Authorization": f"Bearer {session['access_token']}"}
+    url = f"{STRAVA_API_BASE}{path}"
+    started = time.time()
+    response = requests.get(url, headers=headers, params=params, timeout=30)
+    duration_ms = int((time.time() - started) * 1000)
+    logger.info(
+        "Strava GET %s status=%s duration_ms=%s params=%s",
+        path,
+        response.status_code,
+        duration_ms,
+        params or {},
+    )
+
+    if response.status_code == 401 and retry_on_auth:
+        logger.warning("Strava auth expired on %s, attempting token refresh", path)
+        if refresh_access_token():
+            logger.info("Retrying Strava GET %s after token refresh", path)
+            return strava_get(path, params=params, retry_on_auth=False)
+        session.clear()
+        raise StravaAPIError(401, "Authentication expired. Please login again.")
+
+    if response.status_code != 200:
+        details = response.text[:500] if response.text else "Strava API request failed"
+        raise StravaAPIError(response.status_code, details)
+
+    return response.json()
+
+
+def fetch_efforts_page(segment_id: int, page: int, athlete_id: int) -> List[Dict]:
+    logger.info("Requesting efforts page=%s segment=%s", page, segment_id)
+    params = {"per_page": 200, "page": page, "athlete_id": athlete_id}
+    try:
+        page_data = strava_get(f"/segments/{segment_id}/all_efforts", params=params)
+    except StravaAPIError as exc:
+        # Fallback: some apps may not have athlete_id filtering enabled.
+        if exc.status_code == 400:
+            logger.warning(
+                "Strava did not accept athlete_id filter for efforts page=%s segment=%s, retrying without it",
+                page,
+                segment_id,
+            )
+            page_data = strava_get(
+                f"/segments/{segment_id}/all_efforts",
+                params={"per_page": 200, "page": page},
+            )
         else:
-            print(f"No start_index/end_index found for effort in activity {activity_id}")
-            return {'average_heartrate': None, 'max_heartrate': None}
-            
-    except Exception as e:
-        print(f"Error getting segment heart rate: {e}")
-        return {'average_heartrate': None, 'max_heartrate': None}
+            raise
+    logger.info("Fetched efforts page=%s count=%s segment=%s", page, len(page_data), segment_id)
+    return page_data
 
-@app.route('/segment/<int:segment_id>')
+
+def build_effort_payload(segment: Dict, raw_efforts: List[Dict], activities: Dict[int, Dict]) -> List[Dict]:
+    elevation_gain = segment.get("total_elevation_gain") or 0
+    prepared = []
+
+    for effort in raw_efforts:
+        activity_id = effort.get("activity", {}).get("id")
+        if not activity_id:
+            continue
+
+        activity = activities.get(activity_id, {})
+        elapsed = effort.get("elapsed_time") or 0
+
+        vam = None
+        if elevation_gain and elapsed:
+            vam = round((float(elevation_gain) / elapsed) * 3600, 0)
+
+        prepared.append(
+            {
+                "id": effort.get("id"),
+                "start_date": effort.get("start_date"),
+                "bike_id": activity.get("bike_id") or activity.get("gear_id"),
+                "bike_name": activity.get("bike_name")
+                or activity.get("gear", {}).get("name")
+                or (f"Bike {activity.get('gear_id')}" if activity.get("gear_id") else "Unknown"),
+                "elapsed_time": elapsed,
+                "moving_time": effort.get("moving_time") or elapsed,
+                "distance": effort.get("distance") or 0,
+                "average_heartrate": effort.get("average_heartrate") or activity.get("average_heartrate"),
+                "max_heartrate": effort.get("max_heartrate") or activity.get("max_heartrate"),
+                "average_watts": effort.get("average_watts") or activity.get("average_watts"),
+                "normalized_watts": effort.get("weighted_average_watts")
+                or activity.get("weighted_average_watts"),
+                "efficiency": None,
+                "vam": vam,
+                "name": activity.get("name") or f"Activity {activity_id}",
+                "activity_id": activity_id,
+            }
+        )
+
+        current = prepared[-1]
+        avg_hr = current.get("average_heartrate")
+        if avg_hr and avg_hr > 0:
+            np_watts = current.get("normalized_watts")
+            fallback_watts = current.get("average_watts")
+            selected_watts = np_watts if np_watts is not None else fallback_watts
+            if selected_watts is not None:
+                current["efficiency"] = round(float(selected_watts) / float(avg_hr), 3)
+
+    prepared.sort(key=lambda x: x.get("start_date") or "", reverse=True)
+    logger.info(
+        "Prepared effort payload count=%s segment=%s",
+        len(prepared),
+        segment.get("id"),
+    )
+    return prepared
+
+
+def refresh_missing_bike_activities(segment_id: int, athlete_id: int) -> int:
+    missing_activity_ids = repository.get_missing_bike_activity_ids(
+        segment_id=segment_id,
+        athlete_id=athlete_id,
+        limit=MAX_MISSING_BIKE_REFRESH_PER_RUN,
+    )
+    if not missing_activity_ids:
+        return 0
+
+    logger.info(
+        "Refreshing missing bike metadata for segment=%s athlete=%s count=%s",
+        segment_id,
+        athlete_id,
+        len(missing_activity_ids),
+    )
+
+    refreshed: Dict[int, Dict] = {}
+    for idx, activity_id in enumerate(missing_activity_ids, start=1):
+        try:
+            refreshed[activity_id] = strava_get(f"/activities/{activity_id}")
+        except StravaAPIError as exc:
+            if exc.status_code == 429:
+                logger.warning(
+                    "Rate limited while refreshing bike metadata at activity=%s progress=%s/%s",
+                    activity_id,
+                    idx,
+                    len(missing_activity_ids),
+                )
+                break
+            raise
+        if idx % 20 == 0 or idx == len(missing_activity_ids):
+            logger.info(
+                "Bike metadata refresh progress=%s/%s",
+                idx,
+                len(missing_activity_ids),
+            )
+        if idx % 20 == 0:
+            time.sleep(0.3)
+
+    if refreshed:
+        repository.upsert_activities(athlete_id, refreshed)
+    return len(refreshed)
+
+
+def sync_efforts_page(segment: Dict, athlete_id: int, page_data: List[Dict], page: int) -> Tuple[int, bool]:
+    athlete_id_int = normalize_athlete_id(athlete_id)
+    athlete_efforts = [
+        effort
+        for effort in page_data
+        if normalize_athlete_id(effort.get("athlete", {}).get("id")) == athlete_id_int
+    ]
+    logger.info(
+        "Page %s filtered for athlete=%s count=%s/%s",
+        page,
+        athlete_id_int,
+        len(athlete_efforts),
+        len(page_data),
+    )
+    if page_data and not athlete_efforts:
+        sample_ids = sorted(
+            {
+                normalize_athlete_id(effort.get("athlete", {}).get("id"))
+                for effort in page_data[:10]
+            }
+        )
+        logger.warning(
+            "Page %s returned no matching athlete efforts for athlete=%s sample_athlete_ids=%s",
+            page,
+            athlete_id_int,
+            sample_ids,
+        )
+
+    # Keep activities ordered by the recency of their associated efforts.
+    latest_effort_date_by_activity: Dict[int, str] = {}
+    for effort in athlete_efforts:
+        activity_id = effort.get("activity", {}).get("id")
+        if not activity_id:
+            continue
+        start_date = effort.get("start_date") or ""
+        previous = latest_effort_date_by_activity.get(activity_id, "")
+        if start_date > previous:
+            latest_effort_date_by_activity[activity_id] = start_date
+
+    activity_ids = sorted(
+        latest_effort_date_by_activity.keys(),
+        key=lambda activity_id: latest_effort_date_by_activity.get(activity_id, ""),
+        reverse=True,
+    )
+
+    existing_activities = repository.get_activities_by_ids(activity_ids)
+    missing_activity_ids = [activity_id for activity_id in activity_ids if activity_id not in existing_activities]
+    logger.info(
+        "Page %s activity details: total=%s existing=%s missing=%s",
+        page,
+        len(activity_ids),
+        len(existing_activities),
+        len(missing_activity_ids),
+    )
+
+    # Persist page efforts immediately so UI can display data even if enrichment is interrupted.
+    base_payload = build_effort_payload(segment, athlete_efforts, {})
+    repository.upsert_efforts(segment_id=segment["id"], athlete_id=athlete_id_int, efforts=base_payload)
+    rows_written = len(base_payload)
+    logger.info("Page %s stored base effort rows=%s before activity enrichment", page, rows_written)
+
+    fetched_activities: Dict[int, Dict] = {}
+    rate_limited = False
+    activity_ids_to_fetch = missing_activity_ids[:MAX_ACTIVITY_FETCHES_PER_PAGE]
+    if len(missing_activity_ids) > len(activity_ids_to_fetch):
+        logger.info(
+            "Page %s limiting activity enrichment to %s/%s this run",
+            page,
+            len(activity_ids_to_fetch),
+            len(missing_activity_ids),
+        )
+
+    for idx, activity_id in enumerate(activity_ids_to_fetch, start=1):
+        try:
+            fetched_activities[activity_id] = strava_get(f"/activities/{activity_id}")
+        except StravaAPIError as exc:
+            if exc.status_code == 429:
+                rate_limited = True
+                logger.warning(
+                    "Rate limited while enriching page=%s at activity=%s progress=%s/%s",
+                    page,
+                    activity_id,
+                    idx,
+                    len(activity_ids_to_fetch),
+                )
+                break
+            raise
+        if idx % 20 == 0 or idx == len(activity_ids_to_fetch):
+            logger.info(
+                "Page %s fetched missing activity details progress=%s/%s",
+                page,
+                idx,
+                len(activity_ids_to_fetch),
+            )
+        if idx % 20 == 0:
+            time.sleep(0.3)
+
+    if fetched_activities:
+        repository.upsert_activities(athlete_id_int, fetched_activities)
+
+    all_activities = {**existing_activities, **fetched_activities}
+    effort_payload = build_effort_payload(segment, athlete_efforts, all_activities)
+    repository.upsert_efforts(segment_id=segment["id"], athlete_id=athlete_id_int, efforts=effort_payload)
+    logger.info(
+        "Page %s updated enriched effort rows=%s fetched_activities=%s rate_limited=%s",
+        page,
+        len(effort_payload),
+        len(fetched_activities),
+        rate_limited,
+    )
+    return rows_written, rate_limited
+
+
+def sync_segment_batch(segment_id: int, athlete_id: int) -> List[Dict]:
+    athlete_id_int = normalize_athlete_id(athlete_id)
+    if athlete_id_int is None:
+        raise StravaAPIError(401, "Invalid athlete id in session. Please login again.")
+
+    logger.info("Starting batch sync for segment=%s athlete=%s", segment_id, athlete_id_int)
+
+    segment = strava_get(f"/segments/{segment_id}")
+    repository.upsert_segment(segment)
+    logger.info(
+        "Segment metadata stored id=%s name=%s distance=%.2fkm",
+        segment.get("id"),
+        segment.get("name"),
+        (segment.get("distance") or 0) / 1000,
+    )
+
+    sync_state = repository.get_sync_state(segment_id, athlete_id_int)
+    logger.info(
+        "Current sync state segment=%s athlete=%s next_page=%s full_sync_completed=%s",
+        segment_id,
+        athlete_id_int,
+        sync_state["next_page"],
+        sync_state["full_sync_completed"],
+    )
+
+    total_rows_written = 0
+    reached_end = False
+
+    logger.info("Recent refresh phase pages=1..%s", RECENT_REFRESH_PAGES)
+    for page in range(1, RECENT_REFRESH_PAGES + 1):
+        page_data = fetch_efforts_page(segment_id, page, athlete_id_int)
+        if not page_data:
+            reached_end = True
+            logger.info("Reached end of efforts during recent refresh at page=%s", page)
+            break
+
+        page_rows, page_rate_limited = sync_efforts_page(segment, athlete_id_int, page_data, page)
+        total_rows_written += page_rows
+        if page_rate_limited:
+            logger.warning("Stopping sync early after rate-limit in recent phase at page=%s", page)
+            break
+        if len(page_data) < 200:
+            reached_end = True
+            logger.info("Reached final efforts page during recent refresh at page=%s", page)
+            break
+        time.sleep(0.15)
+
+    if reached_end:
+        repository.upsert_sync_state(segment_id, athlete_id_int, next_page=1, full_sync_completed=True)
+    else:
+        start_page = max(sync_state["next_page"], RECENT_REFRESH_PAGES + 1)
+        logger.info(
+            "Backfill phase start_page=%s max_pages_this_run=%s",
+            start_page,
+            BACKFILL_PAGES_PER_RUN,
+        )
+
+        page = start_page
+        processed_pages = 0
+        while processed_pages < BACKFILL_PAGES_PER_RUN:
+            page_data = fetch_efforts_page(segment_id, page, athlete_id_int)
+            if not page_data:
+                reached_end = True
+                logger.info("Reached end of efforts during backfill at page=%s", page)
+                break
+
+            page_rows, page_rate_limited = sync_efforts_page(segment, athlete_id_int, page_data, page)
+            total_rows_written += page_rows
+            processed_pages += 1
+
+            if page_rate_limited:
+                logger.warning("Stopping sync early after rate-limit in backfill at page=%s", page)
+                break
+
+            if len(page_data) < 200:
+                reached_end = True
+                logger.info("Reached final efforts page during backfill at page=%s", page)
+                break
+
+            page += 1
+            repository.upsert_sync_state(segment_id, athlete_id_int, next_page=page, full_sync_completed=False)
+            time.sleep(0.15)
+
+        if reached_end:
+            repository.upsert_sync_state(segment_id, athlete_id_int, next_page=1, full_sync_completed=True)
+        else:
+            repository.upsert_sync_state(segment_id, athlete_id_int, next_page=page, full_sync_completed=False)
+            logger.info("Backfill paused, next run will resume from page=%s", page)
+
+    effort_payload = repository.get_efforts(segment_id, athlete_id_int)
+    bike_refresh_count = refresh_missing_bike_activities(segment_id, athlete_id_int)
+    if bike_refresh_count:
+        effort_payload = repository.get_efforts(segment_id, athlete_id_int)
+
+    logger.info(
+        "Batch sync complete for segment=%s athlete=%s total_efforts_now=%s rows_written_this_run=%s bike_activities_refreshed=%s",
+        segment_id,
+        athlete_id_int,
+        len(effort_payload),
+        total_rows_written,
+        bike_refresh_count,
+    )
+    return effort_payload
+
+
+@app.route("/")
+def index():
+    if "access_token" not in session:
+        return redirect(url_for("login"))
+    return render_template("index.html")
+
+
+@app.route("/login")
+def login():
+    if not STRAVA_CLIENT_ID:
+        return "Configuration Error: STRAVA_CLIENT_ID not set.", 500
+
+    auth_url = (
+        f"{STRAVA_AUTH_URL}?client_id={STRAVA_CLIENT_ID}"
+        f"&response_type=code&redirect_uri={STRAVA_REDIRECT_URI}"
+        "&approval_prompt=force&scope=read,activity:read_all"
+    )
+    return redirect(auth_url)
+
+
+@app.route("/auth/callback")
+def auth_callback():
+    code = request.args.get("code")
+    error = request.args.get("error")
+
+    if error:
+        return f"Authorization failed: {error}", 400
+    if not code:
+        return "Authorization failed - no code received", 400
+
+    payload = {
+        "client_id": STRAVA_CLIENT_ID,
+        "client_secret": STRAVA_CLIENT_SECRET,
+        "code": code,
+        "grant_type": "authorization_code",
+    }
+    response = requests.post(STRAVA_TOKEN_URL, data=payload, timeout=20)
+
+    if response.status_code != 200:
+        return f"Token exchange failed: {response.text}", 400
+
+    token_info = response.json()
+    session["access_token"] = token_info["access_token"]
+    session["refresh_token"] = token_info["refresh_token"]
+    session["athlete_id"] = token_info["athlete"]["id"]
+    return redirect(url_for("index"))
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.route("/segment/<int:segment_id>/sync", methods=["POST"])
+def sync_segment(segment_id):
+    if "access_token" not in session:
+        return jsonify({"error": "Not authenticated"}), 401
+
+    athlete_id = session.get("athlete_id")
+    athlete_id_int = normalize_athlete_id(athlete_id)
+    if athlete_id_int is None:
+        session.clear()
+        return jsonify({"error": "Session athlete id missing/invalid", "needs_reauth": True}), 401
+
+    cooldown_remaining = get_cooldown_remaining_seconds(segment_id, athlete_id_int)
+    if cooldown_remaining > 0:
+        return (
+            jsonify(
+                {
+                    "error": "Rate limited by Strava. Please retry later.",
+                    "retry_after_seconds": cooldown_remaining,
+                }
+            ),
+            429,
+        )
+
+    try:
+        efforts = sync_segment_batch(segment_id, athlete_id_int)
+        return jsonify({"message": "Sync completed", "effort_count": len(efforts)})
+    except StravaAPIError as exc:
+        if exc.status_code == 401:
+            return jsonify({"error": exc.message, "needs_reauth": True}), 401
+        if exc.status_code == 429:
+            set_rate_limit_cooldown(segment_id, athlete_id_int)
+            return (
+                jsonify(
+                    {
+                        "error": "Rate limited by Strava. Please retry later.",
+                        "retry_after_seconds": RATE_LIMIT_COOLDOWN_SECONDS,
+                    }
+                ),
+                429,
+            )
+        return jsonify({"error": f"Sync failed: {exc.message}"}), exc.status_code
+    except requests.exceptions.RequestException:
+        return jsonify({"error": "Failed to connect to Strava API"}), 502
+
+
+@app.route("/segment/<int:segment_id>/efforts")
+def get_segment_efforts(segment_id):
+    if "access_token" not in session:
+        return jsonify({"error": "Not authenticated"}), 401
+
+    athlete_id = session.get("athlete_id")
+    athlete_id_int = normalize_athlete_id(athlete_id)
+    if athlete_id_int is None:
+        session.clear()
+        return jsonify({"error": "Session athlete id missing/invalid", "needs_reauth": True}), 401
+
+    force_refresh = request.args.get("refresh", "false").lower() == "true"
+    logger.info(
+        "Efforts requested segment=%s athlete=%s force_refresh=%s",
+        segment_id,
+        athlete_id_int,
+        force_refresh,
+    )
+
+    efforts = repository.get_efforts(segment_id, athlete_id_int)
+    logger.info("DB lookup returned efforts=%s segment=%s athlete=%s", len(efforts), segment_id, athlete_id_int)
+
+    if force_refresh or not efforts:
+        cooldown_remaining = get_cooldown_remaining_seconds(segment_id, athlete_id_int)
+        if cooldown_remaining > 0:
+            if efforts:
+                logger.warning(
+                    "Cooldown active; returning cached efforts count=%s remaining=%ss",
+                    len(efforts),
+                    cooldown_remaining,
+                )
+                return add_cache_headers(jsonify(efforts))
+            return (
+                jsonify(
+                    {
+                        "error": "Rate limited by Strava. Please retry later.",
+                        "retry_after_seconds": cooldown_remaining,
+                    }
+                ),
+                429,
+            )
+
+        reason = "force_refresh" if force_refresh else "db_empty"
+        logger.info("Running sync for segment=%s athlete=%s reason=%s", segment_id, athlete_id_int, reason)
+        try:
+            efforts = sync_segment_batch(segment_id, athlete_id_int)
+        except StravaAPIError as exc:
+            if exc.status_code == 401:
+                return jsonify({"error": exc.message, "needs_reauth": True}), 401
+            if exc.status_code == 429:
+                set_rate_limit_cooldown(segment_id, athlete_id_int)
+                partial_efforts = repository.get_efforts(segment_id, athlete_id_int)
+                if partial_efforts:
+                    logger.warning(
+                        "Rate limited during sync; returning partial DB efforts count=%s",
+                        len(partial_efforts),
+                    )
+                    return add_cache_headers(jsonify(partial_efforts))
+                return (
+                    jsonify(
+                        {
+                            "error": "Rate limited by Strava. Please retry later.",
+                            "retry_after_seconds": RATE_LIMIT_COOLDOWN_SECONDS,
+                        }
+                    ),
+                    429,
+                )
+            return jsonify({"error": f"Failed to fetch efforts: {exc.message}"}), exc.status_code
+        except requests.exceptions.RequestException:
+            if efforts:
+                logger.warning("Strava unavailable, returning stale DB efforts count=%s", len(efforts))
+                return add_cache_headers(jsonify(efforts))
+            return jsonify({"error": "Failed to connect to Strava API"}), 502
+    else:
+        # Opportunistic bike enrichment for previously synced efforts.
+        cooldown_remaining = get_cooldown_remaining_seconds(segment_id, athlete_id_int)
+        if cooldown_remaining == 0:
+            try:
+                refreshed_bikes = refresh_missing_bike_activities(segment_id, athlete_id_int)
+                if refreshed_bikes:
+                    logger.info(
+                        "Refreshed missing bike metadata during read path count=%s",
+                        refreshed_bikes,
+                    )
+                    efforts = repository.get_efforts(segment_id, athlete_id_int)
+            except StravaAPIError as exc:
+                if exc.status_code == 429:
+                    set_rate_limit_cooldown(segment_id, athlete_id_int)
+                elif exc.status_code == 401:
+                    return jsonify({"error": exc.message, "needs_reauth": True}), 401
+
+    logger.info("Returning efforts response count=%s segment=%s athlete=%s", len(efforts), segment_id, athlete_id_int)
+    return add_cache_headers(jsonify(efforts))
+
+
+@app.route("/segment/<int:segment_id>")
 def segment_analyzer(segment_id):
-    """Show segment analyzer page"""
-    if 'access_token' not in session:
-        return redirect(url_for('login'))
-    
-    # Check cache first
-    segment_info = cache.get('segment', str(segment_id))
-    
-    if segment_info is None:
-        # Get segment info from API
-        access_token = session['access_token']
-        headers = {'Authorization': f'Bearer {access_token}'}
-        segment_url = f"{STRAVA_API_BASE}/segments/{segment_id}"
-        
-        response = requests.get(segment_url, headers=headers)
-        if response.status_code != 200:
-            print(f"Segment API Error: {response.status_code}, {response.text}")
-            return f"Segment not found - Status: {response.status_code}, Error: {response.text}", 404
-        
-        segment_info = response.json()
-        # Cache segment info for 24 hours
-        cache.set('segment', str(segment_id), segment_info)
-    
-    return render_template('segment_analyzer.html', segment=segment_info)
+    if "access_token" not in session:
+        return redirect(url_for("login"))
 
-@app.route('/cache/stats')
-def cache_stats():
-    """Get cache statistics"""
-    if 'access_token' not in session:
-        return jsonify({'error': 'Not authenticated'}), 401
-    
-    stats = cache.get_cache_stats()
-    return jsonify(stats)
+    segment = repository.get_segment(segment_id)
+    if segment is None:
+        logger.info("Segment %s not found in DB, fetching from Strava", segment_id)
+        try:
+            segment = strava_get(f"/segments/{segment_id}")
+            repository.upsert_segment(segment)
+            segment = repository.get_segment(segment_id)
+        except StravaAPIError as exc:
+            if exc.status_code == 401:
+                session.clear()
+                return redirect(url_for("login"))
+            return f"Segment not found - {exc.message}", 404
+    else:
+        logger.info("Segment %s loaded from DB", segment_id)
 
-@app.route('/cache/clear', methods=['POST'])
-def clear_cache():
-    """Clear all cache entries"""
-    if 'access_token' not in session:
-        return jsonify({'error': 'Not authenticated'}), 401
-    
-    cache.clear_all()
-    return jsonify({'message': 'All cache entries cleared'})
+    return render_template("segment_analyzer.html", segment=segment)
 
-@app.route('/health')
+
+@app.route("/db/stats")
+@app.route("/cache/stats")
+def db_stats():
+    if "access_token" not in session:
+        return jsonify({"error": "Not authenticated"}), 401
+    athlete_id_int = normalize_athlete_id(session.get("athlete_id"))
+    segment_id = request.args.get("segment_id", type=int)
+    if segment_id is not None and athlete_id_int is not None:
+        return jsonify(repository.stats(segment_id=segment_id, athlete_id=athlete_id_int))
+    return jsonify(repository.stats())
+
+
+@app.route("/db/clear", methods=["POST"])
+@app.route("/cache/clear", methods=["POST"])
+def clear_db():
+    if "access_token" not in session:
+        return jsonify({"error": "Not authenticated"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    confirm_text = payload.get("confirm_text") or request.form.get("confirm_text")
+    if confirm_text != "CLEAR":
+        return jsonify({"error": "Confirmation required to clear database"}), 400
+
+    repository.clear_all()
+    return jsonify({"message": "All database entries cleared"})
+
+
+@app.route("/health")
 def health_check():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'healthy',
-        'strava_client_id_set': bool(STRAVA_CLIENT_ID),
-        'strava_client_secret_set': bool(STRAVA_CLIENT_SECRET),
-        'strava_redirect_uri': STRAVA_REDIRECT_URI,
-        'session_has_token': 'access_token' in session,
-        'cache_directory_exists': os.path.exists('cache')
-    })
+    return jsonify(
+        {
+            "status": "healthy",
+            "strava_client_id_set": bool(STRAVA_CLIENT_ID),
+            "strava_client_secret_set": bool(STRAVA_CLIENT_SECRET),
+            "strava_redirect_uri": STRAVA_REDIRECT_URI,
+            "session_has_token": "access_token" in session,
+            "db_path": repository.stats().get("db_path"),
+        }
+    )
 
-@app.route('/debug')
-def debug_info():
-    """Debug information (non-sensitive)"""
-    return f"""
-    <h2>Debug Information</h2>
-    <p><strong>STRAVA_CLIENT_ID:</strong> {'✅ SET' if STRAVA_CLIENT_ID else '❌ NOT SET'}</p>
-    <p><strong>STRAVA_CLIENT_SECRET:</strong> {'✅ SET' if STRAVA_CLIENT_SECRET else '❌ NOT SET'}</p>
-    <p><strong>STRAVA_REDIRECT_URI:</strong> {STRAVA_REDIRECT_URI}</p>
-    <p><strong>Cache Directory:</strong> {'✅ EXISTS' if os.path.exists('cache') else '❌ MISSING'}</p>
-    <p><strong>Session has token:</strong> {'✅ YES' if 'access_token' in session else '❌ NO'}</p>
-    <hr>
-    <p><a href="/health">Health Check (JSON)</a></p>
-    <p><a href="/">Back to App</a></p>
-    """
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8000))
-    app.run(debug=False, host='0.0.0.0', port=port) 
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    app.run(debug=False, host="0.0.0.0", port=port)

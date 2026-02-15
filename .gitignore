@@ -3,6 +3,7 @@
 
 # Cache directory
 cache/
+data/
 
 # Python
 __pycache__/

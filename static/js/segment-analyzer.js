@@ -33,12 +33,16 @@ class SegmentAnalyzer {
         document.getElementById('resetDefaults').addEventListener('click', () => this.resetToDefaults());
         
         // Auto-apply filters on input change (debounced)
-        const filterInputs = ['minHeartRate', 'maxHeartRate', 'minPower', 'maxPower', 'startDate', 'endDate'];
+        const filterInputs = ['minHeartRate', 'maxHeartRate', 'minPower', 'maxPower', 'startDate', 'endDate', 'bikeFilter'];
         filterInputs.forEach(id => {
             document.getElementById(id).addEventListener('input', 
                 debounce(() => this.applyFilters(), 500)
             );
         });
+        const bikeFilterSelect = document.getElementById('bikeFilter');
+        if (bikeFilterSelect) {
+            bikeFilterSelect.addEventListener('change', () => this.applyFilters());
+        }
         
         // Sort controls
         document.querySelectorAll('[data-sort]').forEach(header => {
@@ -49,19 +53,28 @@ class SegmentAnalyzer {
         });
         
         // Cache management
-        document.getElementById('clearCacheBtn').addEventListener('click', () => this.clearCache());
+        const clearCacheBtn = document.getElementById('clearCacheBtn');
+        if (clearCacheBtn) {
+            clearCacheBtn.addEventListener('click', () => this.clearCache());
+        }
+
+        const refreshEffortsBtn = document.getElementById('refreshEffortsBtn');
+        if (refreshEffortsBtn) {
+            refreshEffortsBtn.addEventListener('click', () => this.refreshEfforts());
+        }
     }
     
-    async loadEfforts() {
+    async loadEfforts(forceRefresh = false) {
         const loadingIndicator = document.getElementById('loadingIndicator');
         const errorPanel = document.getElementById('errorPanel');
         
         // First, try to load from client-side cache for instant display
-        const cachedData = this.getCachedEfforts();
+        const cachedData = forceRefresh ? null : this.getCachedEfforts();
         if (cachedData && cachedData.length > 0) {
             console.log('Loading from cache for instant display');
             this.allEfforts = cachedData;
             this.filteredEfforts = [...this.allEfforts];
+            this.updateBikeFilterOptions();
             this.renderEfforts();
             this.updateStatistics();
             this.applyFilters();
@@ -72,7 +85,7 @@ class SegmentAnalyzer {
             // Show refresh indicator instead of loading
             this.showRefreshIndicator();
         } else {
-            // No cache, show full loading
+            // No cache or force refresh, show full loading
             loadingIndicator.classList.remove('hidden');
         }
         
@@ -80,13 +93,21 @@ class SegmentAnalyzer {
         try {
             errorPanel.classList.add('hidden');
             
-            const fallbackParam = this.fallbackMode ? '?fallback=true' : '';
-            const response = await axios.get(`/segment/${window.segmentData.id}/efforts${fallbackParam}`);
+            const queryParams = [];
+            if (this.fallbackMode) {
+                queryParams.push('fallback=true');
+            }
+            if (forceRefresh) {
+                queryParams.push('refresh=true');
+            }
+            const queryString = queryParams.length ? `?${queryParams.join('&')}` : '';
+            const response = await axios.get(`/segment/${window.segmentData.id}/efforts${queryString}`);
             const freshData = response.data;
             
             // Update with fresh data
             this.allEfforts = freshData;
             this.filteredEfforts = [...this.allEfforts];
+            this.updateBikeFilterOptions();
             
             // Cache the fresh data
             this.setCachedEfforts(freshData);
@@ -119,10 +140,13 @@ class SegmentAnalyzer {
                             if (error.response?.status === 401 && error.response?.data?.needs_reauth) {
                 showNotification('Session expired. Redirecting to login...', 'warning');
                 setTimeout(() => window.location.reload(), 2000);
-            } else if (error.response?.status === 429 && !this.fallbackMode) {
-                this.fallbackMode = true;
-                showNotification('Rate limit exceeded. Switching to fallback mode (activity-level heart rate).', 'warning');
-                setTimeout(() => this.loadEfforts(), 2000);
+            } else if (error.response?.status === 429) {
+                const retryAfter = error.response?.data?.retry_after_seconds;
+                const message = retryAfter
+                    ? `Rate limit reached. Retry in about ${retryAfter}s.`
+                    : 'Rate limit reached. Please retry later.';
+                this.showError(message);
+                showNotification(message, 'warning');
             } else {
                 this.showError(error.response?.data?.error || 'Failed to load segment efforts');
             }
@@ -140,6 +164,7 @@ class SegmentAnalyzer {
         const maxPower = parseFloat(document.getElementById('maxPower').value) || null;
         const startDate = document.getElementById('startDate').value || null;
         const endDate = document.getElementById('endDate').value || null;
+        const bikeFilter = document.getElementById('bikeFilter').value || null;
         
         this.filteredEfforts = this.allEfforts.filter(effort => {
             // Heart rate filter
@@ -164,6 +189,10 @@ class SegmentAnalyzer {
             const effortDate = new Date(effort.start_date).toISOString().split('T')[0];
             if (startDate && effortDate < startDate) return false;
             if (endDate && effortDate > endDate) return false;
+
+            // Bike filter
+            const effortBike = effort.bike_name || 'Unknown';
+            if (bikeFilter && effortBike !== bikeFilter) return false;
             
             return true;
         });
@@ -181,6 +210,7 @@ class SegmentAnalyzer {
         document.getElementById('maxPower').value = '';
         document.getElementById('startDate').value = '';
         document.getElementById('endDate').value = '';
+        document.getElementById('bikeFilter').value = '';
         
         this.filteredEfforts = [...this.allEfforts];
         this.renderEfforts();
@@ -197,6 +227,7 @@ class SegmentAnalyzer {
         document.getElementById('startDate').value = '2020-01-01';
         const today = new Date().toISOString().split('T')[0];
         document.getElementById('endDate').value = today;
+        document.getElementById('bikeFilter').value = '';
         
         this.applyFilters();
     }
@@ -247,12 +278,25 @@ class SegmentAnalyzer {
         const effortsCount = document.getElementById('effortsCount');
         
         if (this.filteredEfforts.length === 0) {
-            effortsPanel.classList.add('hidden');
+            if (this.allEfforts.length === 0) {
+                effortsPanel.classList.add('hidden');
+                return;
+            }
+
+            effortsPanel.classList.remove('hidden');
+            effortsCount.textContent = `(0 shown / ${this.allEfforts.length} total)`;
+            tableBody.innerHTML = `
+                <tr>
+                    <td colspan="9" class="px-6 py-10 text-center text-sm text-gray-500">
+                        No efforts match your current filters. Click <strong>Clear Filters</strong> to see all efforts.
+                    </td>
+                </tr>
+            `;
             return;
         }
         
         effortsPanel.classList.remove('hidden');
-        effortsCount.textContent = `(${this.filteredEfforts.length} efforts)`;
+        effortsCount.textContent = `(${this.filteredEfforts.length} shown / ${this.allEfforts.length} total)`;
         
         tableBody.innerHTML = this.filteredEfforts.map(effort => `
             <tr class="effort-row">
@@ -264,6 +308,9 @@ class SegmentAnalyzer {
                         ${effort.name}
                     </div>
                 </td>
+                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                    ${effort.bike_name || 'Unknown'}
+                </td>
                 <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900 font-mono">
                     ${formatTime(effort.elapsed_time)}
                 </td>
@@ -271,7 +318,7 @@ class SegmentAnalyzer {
                     ${effort.average_heartrate ? Math.round(effort.average_heartrate) + ' bpm' : 'N/A'}
                 </td>
                 <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                    ${effort.max_heartrate ? Math.round(effort.max_heartrate) + ' bpm' : 'N/A'}
+                    ${effort.efficiency ? effort.efficiency.toFixed(2) + ' W/bpm' : 'N/A'}
                 </td>
                 <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
                     ${effort.average_watts ? Math.round(effort.average_watts) + ' W' : 'N/A'}
@@ -367,7 +414,7 @@ class SegmentAnalyzer {
     }
     
     updateFilterIndicators() {
-        const filterInputs = ['minHeartRate', 'maxHeartRate', 'minPower', 'maxPower', 'startDate', 'endDate'];
+        const filterInputs = ['minHeartRate', 'maxHeartRate', 'minPower', 'maxPower', 'startDate', 'endDate', 'bikeFilter'];
         filterInputs.forEach(id => {
             const input = document.getElementById(id);
             if (input.value) {
@@ -404,16 +451,55 @@ class SegmentAnalyzer {
             fallbackNotice.classList.remove('hidden');
         }
     }
+
+    updateBikeFilterOptions() {
+        const select = document.getElementById('bikeFilter');
+        if (!select) return;
+
+        const current = select.value || '';
+        const bikes = Array.from(
+            new Set(this.allEfforts.map(e => e.bike_name || 'Unknown'))
+        ).sort((a, b) => a.localeCompare(b));
+
+        select.innerHTML = '<option value="">All Bikes</option>' +
+            bikes.map(bike => `<option value="${bike}">${bike}</option>`).join('');
+
+        if (current && bikes.includes(current)) {
+            select.value = current;
+        }
+    }
     
     async loadCacheStats() {
         try {
-            const response = await axios.get('/cache/stats');
+            const response = await axios.get(`/db/stats?segment_id=${window.segmentData.id}`);
             const stats = response.data;
-            
-            document.getElementById('totalFiles').textContent = stats.total_files;
-            document.getElementById('totalSize').textContent = this.formatBytes(stats.total_size);
-            document.getElementById('segmentCount').textContent = stats.by_type.segment || 0;
-            document.getElementById('activityCount').textContent = (stats.by_type.activity || 0) + (stats.by_type.streams || 0);
+            const scope = stats.segment_scope || null;
+            const totalActivities = Number(scope?.activity_count ?? 0);
+            const enrichedActivities = Number(scope?.enriched_activity_count ?? 0);
+            const missingActivities = Number(
+                scope?.missing_activity_count ?? Math.max(0, totalActivities - enrichedActivities)
+            );
+
+            document.getElementById('totalFiles').textContent = scope ? scope.effort_count : '-';
+            document.getElementById('totalSize').textContent = this.formatBytes(stats.total_size || 0);
+            document.getElementById('segmentCount').textContent = scope
+                ? `${enrichedActivities}/${totalActivities}`
+                : '-';
+            document.getElementById('activityCount').textContent =
+                scope && scope.sync_state ? (scope.sync_state.full_sync_completed ? 'Yes' : 'No') : 'No';
+
+            const syncText = document.getElementById('syncStatusText');
+            if (syncText) {
+                if (!scope) {
+                    syncText.innerHTML = '<i class="fas fa-info-circle mr-1"></i>No segment-specific stats yet.';
+                } else if (!scope.sync_state) {
+                    syncText.innerHTML = '<i class="fas fa-info-circle mr-1"></i>Sync has not started for this segment.';
+                } else {
+                    const nextPage = scope.sync_state.next_page;
+                    const updatedAt = scope.sync_state.updated_at ? new Date(scope.sync_state.updated_at).toLocaleString() : 'unknown';
+                    syncText.innerHTML = `<i class="fas fa-info-circle mr-1"></i>Missing activity details: ${missingActivities}. Next backfill page: ${nextPage}. Last update: ${updatedAt}.`;
+                }
+            }
         } catch (error) {
             console.error('Error loading cache stats:', error);
         }
@@ -421,12 +507,46 @@ class SegmentAnalyzer {
     
     async clearCache() {
         try {
-            await axios.post('/cache/clear');
-            showNotification('Expired cache entries cleared', 'success');
+            const firstConfirm = window.confirm(
+                'This will delete all local database data (all segments, efforts, and activities). Continue?'
+            );
+            if (!firstConfirm) {
+                return;
+            }
+
+            const typed = window.prompt('Type CLEAR to confirm database wipe:');
+            if (typed !== 'CLEAR') {
+                showNotification('Database clear cancelled', 'info');
+                return;
+            }
+
+            await axios.post('/db/clear', { confirm_text: 'CLEAR' });
+            // Clear browser storage
+            localStorage.clear();
+            if (window.indexedDB) {
+                const request = indexedDB.deleteDatabase('stravaCache');
+                request.onsuccess = () => {
+                    console.log('IndexedDB cleared');
+                };
+            }
+            showNotification('Database cleared', 'success');
             this.loadCacheStats(); // Refresh stats
+            // Reload efforts from API
+            await this.loadEfforts(true);
         } catch (error) {
-            console.error('Error clearing cache:', error);
-            showNotification('Error clearing cache', 'error');
+            console.error('Error clearing database:', error);
+            showNotification('Error clearing database', 'error');
+        }
+    }
+
+    async refreshEfforts() {
+        try {
+            showNotification('Refreshing efforts from Strava...', 'info');
+            await this.loadEfforts(true);
+            showNotification('Efforts refreshed successfully', 'success');
+        } catch (error) {
+            console.error('Error refreshing efforts:', error);
+            showNotification('Error refreshing efforts', 'error');
         }
     }
     
