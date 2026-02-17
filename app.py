@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import time
@@ -49,6 +50,29 @@ class StravaAPIError(Exception):
         self.status_code = status_code
         self.message = message
         super().__init__(message)
+
+
+def parse_strava_error_response(response_text: str, status_code: int) -> str:
+    """Parse Strava API error JSON into a user-friendly message."""
+    if not response_text or not response_text.strip().startswith("{"):
+        return "Strava API request failed" if status_code != 200 else response_text[:200]
+    try:
+        data = json.loads(response_text)
+        msg = data.get("message", "")
+        errors = data.get("errors", [])
+        if status_code == 429:
+            return "Strava rate limit exceeded. Please try again in 15–20 minutes."
+        if msg and errors:
+            return f"{msg}"
+        if msg:
+            return msg
+        if errors and isinstance(errors, list) and errors:
+            first = errors[0]
+            if isinstance(first, dict) and first.get("field"):
+                return f"Strava API error: {first.get('field', '')}"
+        return response_text[:200]
+    except (json.JSONDecodeError, TypeError):
+        return response_text[:200] if response_text else "Strava API request failed"
 
 
 def normalize_athlete_id(value):
@@ -175,7 +199,9 @@ def strava_get(path: str, params: Dict | None = None, retry_on_auth=True):
         raise StravaAPIError(401, "Authentication expired. Please login again.")
 
     if response.status_code != 200:
-        details = response.text[:500] if response.text else "Strava API request failed"
+        details = parse_strava_error_response(
+            response.text or "", response.status_code
+        )
         raise StravaAPIError(response.status_code, details)
 
     return response.json()
@@ -733,7 +759,39 @@ def segment_analyzer(segment_id):
             if exc.status_code == 401:
                 session.clear()
                 return redirect(url_for("login"))
-            return f"Segment not found - {exc.message}", 404
+            if exc.status_code == 429:
+                return (
+                    render_template(
+                        "error.html",
+                        title="Rate limit exceeded",
+                        message=exc.message,
+                        segment_id=segment_id,
+                        is_rate_limit=True,
+                        retry_after_seconds=900,
+                    ),
+                    429,
+                )
+            if exc.status_code == 404:
+                return (
+                    render_template(
+                        "error.html",
+                        title="Segment not found",
+                        message="This segment doesn't exist or you don't have access to it.",
+                        segment_id=None,
+                        is_rate_limit=False,
+                    ),
+                    404,
+                )
+            return (
+                render_template(
+                    "error.html",
+                    title="Unable to load segment",
+                    message=exc.message,
+                    segment_id=segment_id,
+                    is_rate_limit=False,
+                ),
+                exc.status_code,
+            )
     else:
         logger.info("Segment %s loaded from DB", segment_id)
 
