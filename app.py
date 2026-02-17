@@ -290,11 +290,12 @@ def build_effort_payload(segment: Dict, raw_efforts: List[Dict], activities: Dic
 def compute_decoupling(efforts: List[Dict]) -> None:
     """Add decoupling_pct to efforts from the same activity with 2+ efforts.
 
-    Decoupling % = (EF1 - EF2) / EF1 × 100 (Pw:HR drift)
-    EF = efficiency factor = normalized_watts / avg_heartrate (or average_watts fallback)
+    Efforts sorted by start_date (chronological).
+    EF_i = (NP_i or Pavg_i) / HRavg_i
+    DEC_session = (EF_first - EF_last) / EF_first * 100
 
-    For 2 efforts: (EF_first - EF_last) / EF_first × 100
-    For 3+ efforts: average of consecutive decouplings between all pairs.
+    Only valid when power and time stayed relatively constant:
+    valid = (|P_last - P_first|/P_first <= 0.03) AND (|time_last - time_first|/time_first <= 0.05)
     """
     from collections import defaultdict
 
@@ -310,33 +311,47 @@ def compute_decoupling(efforts: List[Dict]) -> None:
 
         group_sorted = sorted(group, key=lambda x: x.get("start_date") or "")
 
+        def get_p(effort: Dict) -> Optional[float]:
+            p = effort.get("normalized_watts") or effort.get("average_watts")
+            return float(p) if p is not None else None
+
         def get_ef(effort: Dict) -> Optional[float]:
             ef = effort.get("efficiency")
             if ef is not None:
                 return float(ef)
             hr = effort.get("average_heartrate")
-            wat = effort.get("normalized_watts") or effort.get("average_watts")
-            if hr and hr > 0 and wat is not None:
-                return float(wat) / float(hr)
+            p = get_p(effort)
+            if hr and hr > 0 and p is not None:
+                return p / float(hr)
             return None
 
-        efs = [(e, get_ef(e)) for e in group_sorted]
-        efs = [(e, ef) for e, ef in efs if ef is not None and ef > 0]
-
-        if len(efs) < 2:
+        first_eff, last_eff = group_sorted[0], group_sorted[-1]
+        ef_first = get_ef(first_eff)
+        ef_last = get_ef(last_eff)
+        if ef_first is None or ef_last is None or ef_first <= 0:
             continue
 
-        decouplings = []
-        for i in range(len(efs) - 1):
-            ef_curr = efs[i][1]
-            ef_next = efs[i + 1][1]
-            if ef_curr > 0:
-                decouplings.append((ef_curr - ef_next) / ef_curr * 100)
+        p_first = get_p(first_eff)
+        p_last = get_p(last_eff)
+        time_first = first_eff.get("elapsed_time") or first_eff.get("moving_time") or 0
+        time_last = last_eff.get("elapsed_time") or last_eff.get("moving_time") or 0
 
-        if not decouplings:
+        valid = True
+        if p_first and p_first > 0 and p_last is not None:
+            if abs(p_last - p_first) / p_first > 0.03:
+                valid = False
+        else:
+            valid = False
+        if time_first and time_first > 0 and time_last is not None:
+            if abs(time_last - time_first) / time_first > 0.05:
+                valid = False
+        else:
+            valid = False
+
+        if not valid:
             continue
 
-        decoupling_pct = round(sum(decouplings) / len(decouplings), 1)
+        decoupling_pct = round((ef_first - ef_last) / ef_first * 100, 1)
         for e in group:
             e["decoupling_pct"] = decoupling_pct
 

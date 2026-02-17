@@ -2,8 +2,9 @@
 
 /**
  * Compute decoupling % for efforts from the same activity (2+ efforts).
- * Decoupling = (EF1 − EF2) / EF1 × 100. For 3+ efforts: avg of consecutive pairs.
- * EF = efficiency = normalized_watts/HR or average_watts/HR.
+ * Efforts sorted by start_date. EF_i = (NP_i or Pavg_i) / HRavg_i
+ * DEC_session = (EF_first - EF_last) / EF_first * 100
+ * Valid only when: |P_last-P_first|/P_first <= 0.03 AND |time_last-time_first|/time_first <= 0.05
  */
 function computeDecoupling(efforts) {
     const byActivity = {};
@@ -14,26 +15,36 @@ function computeDecoupling(efforts) {
             byActivity[aid].push(e);
         }
     });
+    const getP = (eff) => {
+        const p = eff.normalized_watts ?? eff.average_watts;
+        return p != null ? p : null;
+    };
+    const getEF = (eff) => {
+        if (eff.efficiency != null) return eff.efficiency;
+        const hr = eff.average_heartrate;
+        const p = getP(eff);
+        if (hr && hr > 0 && p != null) return p / hr;
+        return null;
+    };
     Object.values(byActivity).forEach(group => {
         if (group.length < 2) return;
         const sorted = [...group].sort((a, b) => (a.start_date || '').localeCompare(b.start_date || ''));
-        const getEF = (eff) => {
-            if (eff.efficiency != null) return eff.efficiency;
-            const hr = eff.average_heartrate;
-            const wat = eff.normalized_watts ?? eff.average_watts;
-            if (hr && hr > 0 && wat != null) return wat / hr;
-            return null;
-        };
-        const withEF = sorted.map(e => ({ e, ef: getEF(e) })).filter(({ ef }) => ef != null && ef > 0);
-        if (withEF.length < 2) return;
-        const decouplings = [];
-        for (let i = 0; i < withEF.length - 1; i++) {
-            const efCurr = withEF[i].ef;
-            const efNext = withEF[i + 1].ef;
-            if (efCurr > 0) decouplings.push((efCurr - efNext) / efCurr * 100);
-        }
-        if (decouplings.length === 0) return;
-        const pct = Math.round(decouplings.reduce((a, b) => a + b, 0) / decouplings.length * 10) / 10;
+        const first = sorted[0];
+        const last = sorted[sorted.length - 1];
+        const efFirst = getEF(first);
+        const efLast = getEF(last);
+        if (efFirst == null || efLast == null || efFirst <= 0) return;
+        const pFirst = getP(first);
+        const pLast = getP(last);
+        const timeFirst = first.elapsed_time ?? first.moving_time ?? 0;
+        const timeLast = last.elapsed_time ?? last.moving_time ?? 0;
+        let valid = true;
+        if (pFirst == null || pFirst <= 0 || pLast == null) valid = false;
+        else if (Math.abs(pLast - pFirst) / pFirst > 0.03) valid = false;
+        if (timeFirst <= 0 || timeLast == null) valid = false;
+        else if (Math.abs(timeLast - timeFirst) / timeFirst > 0.05) valid = false;
+        if (!valid) return;
+        const pct = Math.round((efFirst - efLast) / efFirst * 1000) / 10;
         group.forEach(e => { e.decoupling_pct = pct; });
     });
 }
