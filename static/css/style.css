@@ -88,6 +88,13 @@ select:focus {
     box-shadow: 0 0 0 2px rgba(252, 76, 2, 0.14) !important;
 }
 
+/* Filter panel: unified styling so all inputs and selects match */
+.filter-inputs input,
+.filter-inputs select {
+    border-color: #fcb79a !important;
+    background: #fff4ef !important;
+}
+
 .filter-active {
     background: #fff4ef !important;
     border-color: #fcb79a !important;
