@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -285,6 +285,60 @@ def build_effort_payload(segment: Dict, raw_efforts: List[Dict], activities: Dic
         segment.get("id"),
     )
     return prepared
+
+
+def compute_decoupling(efforts: List[Dict]) -> None:
+    """Add decoupling_pct to efforts from the same activity with 2+ efforts.
+
+    Decoupling % = (EF1 - EF2) / EF1 × 100 (Pw:HR drift)
+    EF = efficiency factor = normalized_watts / avg_heartrate (or average_watts fallback)
+
+    For 2 efforts: (EF_first - EF_last) / EF_first × 100
+    For 3+ efforts: average of consecutive decouplings between all pairs.
+    """
+    from collections import defaultdict
+
+    by_activity: Dict[int, List[Dict]] = defaultdict(list)
+    for e in efforts:
+        aid = e.get("activity_id")
+        if aid:
+            by_activity[aid].append(e)
+
+    for group in by_activity.values():
+        if len(group) < 2:
+            continue
+
+        group_sorted = sorted(group, key=lambda x: x.get("start_date") or "")
+
+        def get_ef(effort: Dict) -> Optional[float]:
+            ef = effort.get("efficiency")
+            if ef is not None:
+                return float(ef)
+            hr = effort.get("average_heartrate")
+            wat = effort.get("normalized_watts") or effort.get("average_watts")
+            if hr and hr > 0 and wat is not None:
+                return float(wat) / float(hr)
+            return None
+
+        efs = [(e, get_ef(e)) for e in group_sorted]
+        efs = [(e, ef) for e, ef in efs if ef is not None and ef > 0]
+
+        if len(efs) < 2:
+            continue
+
+        decouplings = []
+        for i in range(len(efs) - 1):
+            ef_curr = efs[i][1]
+            ef_next = efs[i + 1][1]
+            if ef_curr > 0:
+                decouplings.append((ef_curr - ef_next) / ef_curr * 100)
+
+        if not decouplings:
+            continue
+
+        decoupling_pct = round(sum(decouplings) / len(decouplings), 1)
+        for e in group:
+            e["decoupling_pct"] = decoupling_pct
 
 
 def refresh_missing_bike_activities(segment_id: int, athlete_id: int) -> int:
@@ -679,6 +733,7 @@ def get_segment_efforts(segment_id):
                     len(efforts),
                     cooldown_remaining,
                 )
+                compute_decoupling(efforts)
                 return add_cache_headers(jsonify(efforts))
             return (
                 jsonify(
@@ -705,6 +760,7 @@ def get_segment_efforts(segment_id):
                         "Rate limited during sync; returning partial DB efforts count=%s",
                         len(partial_efforts),
                     )
+                    compute_decoupling(partial_efforts)
                     return add_cache_headers(jsonify(partial_efforts))
                 return (
                     jsonify(
@@ -719,6 +775,7 @@ def get_segment_efforts(segment_id):
         except requests.exceptions.RequestException:
             if efforts:
                 logger.warning("Strava unavailable, returning stale DB efforts count=%s", len(efforts))
+                compute_decoupling(efforts)
                 return add_cache_headers(jsonify(efforts))
             return jsonify({"error": "Failed to connect to Strava API"}), 502
     else:
@@ -740,6 +797,7 @@ def get_segment_efforts(segment_id):
                     return jsonify({"error": exc.message, "needs_reauth": True}), 401
 
     logger.info("Returning efforts response count=%s segment=%s athlete=%s", len(efforts), segment_id, athlete_id_int)
+    compute_decoupling(efforts)
     return add_cache_headers(jsonify(efforts))
 
 

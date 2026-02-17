@@ -1,5 +1,43 @@
 // Segment Analyzer JavaScript
 
+/**
+ * Compute decoupling % for efforts from the same activity (2+ efforts).
+ * Decoupling = (EF1 − EF2) / EF1 × 100. For 3+ efforts: avg of consecutive pairs.
+ * EF = efficiency = normalized_watts/HR or average_watts/HR.
+ */
+function computeDecoupling(efforts) {
+    const byActivity = {};
+    efforts.forEach(e => {
+        const aid = e.activity_id;
+        if (aid) {
+            if (!byActivity[aid]) byActivity[aid] = [];
+            byActivity[aid].push(e);
+        }
+    });
+    Object.values(byActivity).forEach(group => {
+        if (group.length < 2) return;
+        const sorted = [...group].sort((a, b) => (a.start_date || '').localeCompare(b.start_date || ''));
+        const getEF = (eff) => {
+            if (eff.efficiency != null) return eff.efficiency;
+            const hr = eff.average_heartrate;
+            const wat = eff.normalized_watts ?? eff.average_watts;
+            if (hr && hr > 0 && wat != null) return wat / hr;
+            return null;
+        };
+        const withEF = sorted.map(e => ({ e, ef: getEF(e) })).filter(({ ef }) => ef != null && ef > 0);
+        if (withEF.length < 2) return;
+        const decouplings = [];
+        for (let i = 0; i < withEF.length - 1; i++) {
+            const efCurr = withEF[i].ef;
+            const efNext = withEF[i + 1].ef;
+            if (efCurr > 0) decouplings.push((efCurr - efNext) / efCurr * 100);
+        }
+        if (decouplings.length === 0) return;
+        const pct = Math.round(decouplings.reduce((a, b) => a + b, 0) / decouplings.length * 10) / 10;
+        group.forEach(e => { e.decoupling_pct = pct; });
+    });
+}
+
 class SegmentAnalyzer {
     constructor() {
         this.allEfforts = [];
@@ -73,6 +111,7 @@ class SegmentAnalyzer {
         if (cachedData && cachedData.length > 0) {
             console.log('Loading from cache for instant display');
             this.allEfforts = cachedData;
+            computeDecoupling(this.allEfforts);
             this.filteredEfforts = [...this.allEfforts];
             this.updateBikeFilterOptions();
             this.renderEfforts();
@@ -104,8 +143,9 @@ class SegmentAnalyzer {
             const response = await axios.get(`/segment/${window.segmentData.id}/efforts${queryString}`);
             const freshData = response.data;
             
-            // Update with fresh data
+            // Update with fresh data (compute decoupling in case backend didn't or cache)
             this.allEfforts = freshData;
+            computeDecoupling(this.allEfforts);
             this.filteredEfforts = [...this.allEfforts];
             this.updateBikeFilterOptions();
             
@@ -300,39 +340,17 @@ class SegmentAnalyzer {
         
         tableBody.innerHTML = this.filteredEfforts.map(effort => `
             <tr class="effort-row">
-                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                    ${formatDate(effort.start_date)}
+                <td class="text-gray-900" title="${formatDate(effort.start_date)}">${formatDate(effort.start_date)}</td>
+                <td class="text-gray-900">
+                    <a href="https://www.strava.com/activities/${effort.activity_id}" target="_blank" class="text-orange-600 hover:text-orange-900 truncate block max-w-[3.5rem]" title="${(effort.name || '').replace(/"/g, '&quot;')} (View on Strava)">${effort.name || '—'}</a>
                 </td>
-                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                    <div class="max-w-xs truncate" title="${effort.name}">
-                        ${effort.name}
-                    </div>
-                </td>
-                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                    ${effort.bike_name || 'Unknown'}
-                </td>
-                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900 font-mono">
-                    ${formatTime(effort.elapsed_time)}
-                </td>
-                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                    ${effort.average_heartrate ? Math.round(effort.average_heartrate) + ' bpm' : 'N/A'}
-                </td>
-                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                    ${effort.efficiency ? effort.efficiency.toFixed(2) + ' W/bpm' : 'N/A'}
-                </td>
-                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                    ${effort.average_watts ? Math.round(effort.average_watts) + ' W' : 'N/A'}
-                </td>
-                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                    ${effort.vam ? effort.vam + ' m/h' : 'N/A'}
-                </td>
-                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                    <a href="https://www.strava.com/activities/${effort.activity_id}" 
-                       target="_blank" 
-                       class="text-orange-600 hover:text-orange-900 transition duration-200">
-                        <i class="fas fa-external-link-alt mr-1"></i>View Activity
-                    </a>
-                </td>
+                <td class="text-gray-900">${effort.bike_name || '—'}</td>
+                <td class="text-gray-900 font-mono">${formatTime(effort.elapsed_time)}</td>
+                <td class="text-gray-900">${effort.average_heartrate ? Math.round(effort.average_heartrate) + ' bpm' : '—'}</td>
+                <td class="text-gray-900">${effort.efficiency ? effort.efficiency.toFixed(2) : '—'}</td>
+                <td class="text-gray-900">${effort.average_watts ? Math.round(effort.average_watts) + ' W' : '—'}</td>
+                <td class="text-gray-900">${effort.vam ? effort.vam + ' m/h' : '—'}</td>
+                <td class="text-gray-900">${effort.decoupling_pct != null ? effort.decoupling_pct + '%' : '—'}</td>
             </tr>
         `).join('');
     }

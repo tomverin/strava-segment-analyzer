@@ -123,7 +123,11 @@ select:focus {
     opacity: 1;
 }
 
-/* Table */
+/* Table - compact layout */
+#effortsTable {
+    font-size: 0.8125rem;
+}
+
 #effortsTable thead {
     background: #f9fafb;
 }
@@ -132,7 +136,25 @@ select:focus {
     color: #6b7280;
     font-weight: 700;
     letter-spacing: 0.04em;
+    padding: 0.375rem 0.5rem !important;
+    font-size: 0.6875rem;
+    white-space: nowrap;
 }
+
+#effortsTable td {
+    padding: 0.25rem 0.5rem !important;
+    white-space: nowrap;
+}
+
+#effortsTable .col-date { min-width: 5.5rem; white-space: nowrap; }
+#effortsTable .col-activity { max-width: 4rem; }
+#effortsTable .col-bike { width: 1%; white-space: nowrap; }
+#effortsTable .col-time { min-width: 3.5rem; white-space: nowrap; }
+#effortsTable .col-hr { min-width: 4rem; white-space: nowrap; }
+#effortsTable .col-eff { width: 1%; white-space: nowrap; }
+#effortsTable .col-power { min-width: 4rem; white-space: nowrap; }
+#effortsTable .col-vam { min-width: 5.75rem; white-space: nowrap; }
+#effortsTable .col-dec { width: 1%; white-space: nowrap; }
 
 .effort-row:hover {
     background: #fff7f2;
