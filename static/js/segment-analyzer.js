@@ -1,5 +1,89 @@
 // Segment Analyzer JavaScript
 
+// --- Baseline / Readiness (Forme%) - configurable defaults ---
+const READINESS_CONFIG = {
+    z2HrMin: 128,
+    z2HrMax: 138,
+    baselineWindowDays: 120,
+    baselineTopN: 10,
+};
+
+/**
+ * EFF (Efficiency Factor) = (NP or Pavg) / HRavg in W/bpm.
+ * Used for baseline and Forme% calculations.
+ */
+function getEF(effort) {
+    if (effort.efficiency != null) return effort.efficiency;
+    const hr = effort.average_heartrate;
+    const p = effort.normalized_watts ?? effort.average_watts;
+    if (hr && hr > 0 && p != null) return p / hr;
+    return null;
+}
+
+function getPowerUsed(effort) {
+    return effort.normalized_watts ?? effort.average_watts;
+}
+
+/**
+ * Is effort "Z2 strict valid" for baseline calculation.
+ * Rules: HR in [z2HrMin, z2HrMax], HR and power non-null/non-zero.
+ * Optional: lowConfidence if Pw:Hr variance would fail (power ±3%, time ±5%).
+ */
+function isZ2Strict(effort, config = READINESS_CONFIG) {
+    const hr = effort.average_heartrate;
+    const power = getPowerUsed(effort);
+    if (hr == null || hr <= 0 || power == null || power <= 0) return { valid: false };
+    const hrMin = config.z2HrMin ?? 132;
+    const hrMax = config.z2HrMax ?? 138;
+    if (hr < hrMin || hr > hrMax) return { valid: false };
+    return { valid: true };
+}
+
+/**
+ * Compute median of a sorted array of numbers.
+ */
+function median(values) {
+    if (!values || values.length === 0) return null;
+    const sorted = [...values].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/**
+ * Baseline = median of top N EFF among Z2-strict-valid efforts in the last windowDays.
+ */
+function computeBaseline(efforts, config = READINESS_CONFIG) {
+    const windowDays = config.baselineWindowDays ?? 120;
+    const topN = config.baselineTopN ?? 10;
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - windowDays);
+    const cutoffStr = cutoff.toISOString().slice(0, 10);
+    const valid = efforts.filter(e => {
+        const sd = (e.start_date || '').slice(0, 10);
+        if (sd < cutoffStr) return false;
+        const { valid: ok } = isZ2Strict(e, config);
+        if (!ok) return false;
+        const ef = getEF(e);
+        return ef != null && ef > 0;
+    });
+    if (valid.length === 0) return { baseline: null, count: 0, efforts: [] };
+    const withEF = valid.map(e => ({ e, ef: getEF(e) })).sort((a, b) => b.ef - a.ef);
+    const top = withEF.slice(0, topN).map(x => x.ef);
+    const baseline = median(top);
+    return { baseline, count: top.length, efforts: withEF.slice(0, topN) };
+}
+
+/**
+ * Forme% = (EFF_today / baseline - 1) * 100
+ * ΔEFF = EFF_today - baseline
+ */
+function computeReadiness(effortEF, baseline) {
+    if (baseline == null || baseline <= 0 || effortEF == null || effortEF <= 0) return null;
+    const formePct = Math.round((effortEF / baseline - 1) * 1000) / 10;
+    const deltaEF = Math.round((effortEF - baseline) * 1000) / 1000;
+    return { formePct, deltaEF };
+}
+
 /**
  * Compute decoupling % for efforts from the same activity (2+ efforts).
  * Efforts sorted by start_date. EF_i = (NP_i or Pavg_i) / HRavg_i
@@ -15,17 +99,6 @@ function computeDecoupling(efforts) {
             byActivity[aid].push(e);
         }
     });
-    const getP = (eff) => {
-        const p = eff.normalized_watts ?? eff.average_watts;
-        return p != null ? p : null;
-    };
-    const getEF = (eff) => {
-        if (eff.efficiency != null) return eff.efficiency;
-        const hr = eff.average_heartrate;
-        const p = getP(eff);
-        if (hr && hr > 0 && p != null) return p / hr;
-        return null;
-    };
     Object.values(byActivity).forEach(group => {
         if (group.length < 2) return;
         const sorted = [...group].sort((a, b) => (a.start_date || '').localeCompare(b.start_date || ''));
@@ -34,8 +107,8 @@ function computeDecoupling(efforts) {
         const efFirst = getEF(first);
         const efLast = getEF(last);
         if (efFirst == null || efLast == null || efFirst <= 0) return;
-        const pFirst = getP(first);
-        const pLast = getP(last);
+        const pFirst = getPowerUsed(first);
+        const pLast = getPowerUsed(last);
         const timeFirst = first.elapsed_time ?? first.moving_time ?? 0;
         const timeLast = last.elapsed_time ?? last.moving_time ?? 0;
         let valid = true;
@@ -55,6 +128,8 @@ class SegmentAnalyzer {
         this.filteredEfforts = [];
         this.currentSort = { field: 'start_date', direction: 'desc' };
         this.fallbackMode = false;
+        this.selectedEffortId = null;
+        this.baselineResult = null;
         
         this.init();
     }
@@ -111,6 +186,26 @@ class SegmentAnalyzer {
         if (refreshEffortsBtn) {
             refreshEffortsBtn.addEventListener('click', () => this.refreshEfforts());
         }
+
+        const z2Toggle = document.getElementById('useZ2StrictBaseline');
+        if (z2Toggle) {
+            z2Toggle.addEventListener('change', () => {
+                this.updateReadinessUI();
+                this.renderEfforts();
+            });
+        }
+
+        document.getElementById('effortsTable')?.addEventListener('click', (e) => {
+            if (e.target.closest('a')) return; // let links work
+            const row = e.target.closest('.effort-row');
+            if (!row) return;
+            const id = row.dataset.effortId;
+            if (id) {
+                this.selectedEffortId = id === this.selectedEffortId ? null : id;
+                this.updateReadinessUI();
+                this.renderEfforts();
+            }
+        });
     }
     
     async loadEfforts(forceRefresh = false) {
@@ -249,6 +344,7 @@ class SegmentAnalyzer {
         });
         
         this.sortEfforts(this.currentSort.field, this.currentSort.direction);
+        this.updateReadinessUI();
         this.renderEfforts();
         this.updateStatistics();
         this.updateFilterIndicators();
@@ -264,6 +360,7 @@ class SegmentAnalyzer {
         document.getElementById('bikeFilter').value = '';
         
         this.filteredEfforts = [...this.allEfforts];
+        this.updateReadinessUI();
         this.renderEfforts();
         this.updateStatistics();
         this.updateFilterIndicators();
@@ -298,16 +395,19 @@ class SegmentAnalyzer {
         this.filteredEfforts.sort((a, b) => {
             let aVal = a[field];
             let bVal = b[field];
-            
-            // Handle different data types
-            if (field === 'start_date') {
+
+            if (field === 'forme_pct') {
+                const base = this.baselineResult?.baseline;
+                aVal = base && getEF(a) ? computeReadiness(getEF(a), base)?.formePct : null;
+                bVal = base && getEF(b) ? computeReadiness(getEF(b), base)?.formePct : null;
+            } else if (field === 'start_date') {
                 aVal = new Date(aVal);
                 bVal = new Date(bVal);
             } else if (typeof aVal === 'string') {
                 aVal = aVal.toLowerCase();
                 bVal = bVal.toLowerCase();
             }
-            
+
             // Handle null values
             if (aVal === null || aVal === undefined) aVal = direction === 'asc' ? Infinity : -Infinity;
             if (bVal === null || bVal === undefined) bVal = direction === 'asc' ? Infinity : -Infinity;
@@ -318,7 +418,8 @@ class SegmentAnalyzer {
                 return aVal < bVal ? 1 : -1;
             }
         });
-        
+
+        this.updateReadinessUI();
         this.renderEfforts();
         this.updateSortIndicators(field, direction);
     }
@@ -338,7 +439,7 @@ class SegmentAnalyzer {
             effortsCount.textContent = `(0 shown / ${this.allEfforts.length} total)`;
             tableBody.innerHTML = `
                 <tr>
-                    <td colspan="9" class="px-6 py-10 text-center text-sm text-gray-500">
+                    <td colspan="11" class="px-6 py-10 text-center text-sm text-gray-500">
                         No efforts match your current filters. Click <strong>Clear Filters</strong> to see all efforts.
                     </td>
                 </tr>
@@ -348,9 +449,18 @@ class SegmentAnalyzer {
         
         effortsPanel.classList.remove('hidden');
         effortsCount.textContent = `(${this.filteredEfforts.length} shown / ${this.allEfforts.length} total)`;
+
+        const baseline = this.baselineResult?.baseline;
         
-        tableBody.innerHTML = this.filteredEfforts.map(effort => `
-            <tr class="effort-row">
+        tableBody.innerHTML = this.filteredEfforts.map(effort => {
+            const effortId = String(effort.id ?? `${effort.activity_id}_${effort.start_date}`);
+            const selected = effortId === this.selectedEffortId;
+            const { valid: z2Valid } = isZ2Strict(effort);
+            const eff = getEF(effort);
+            const r = baseline && eff ? computeReadiness(eff, baseline) : null;
+            const formeCell = r != null ? (r.formePct >= 0 ? '+' : '') + r.formePct + '%' : '—';
+            return `
+            <tr class="effort-row ${selected ? 'bg-orange-50 ring-1 ring-orange-200' : ''}" data-effort-id="${effortId}">
                 <td class="text-gray-900" title="${formatDate(effort.start_date)}">${formatDate(effort.start_date)}</td>
                 <td class="text-gray-900">
                     <a href="https://www.strava.com/activities/${effort.activity_id}" target="_blank" class="text-orange-600 hover:text-orange-900 truncate block max-w-[3.5rem]" title="${(effort.name || '').replace(/"/g, '&quot;')} (View on Strava)">${effort.name || '—'}</a>
@@ -362,10 +472,82 @@ class SegmentAnalyzer {
                 <td class="text-gray-900">${effort.average_watts ? Math.round(effort.average_watts) + ' W' : '—'}</td>
                 <td class="text-gray-900">${effort.vam ? effort.vam + ' m/h' : '—'}</td>
                 <td class="text-gray-900">${effort.decoupling_pct != null ? effort.decoupling_pct + '%' : '—'}</td>
+                <td class="text-gray-900 col-z2" title="${z2Valid ? 'Z2 strict valid' : 'Not Z2 strict'}">${z2Valid ? '<i class="fas fa-check text-green-600"></i>' : '—'}</td>
+                <td class="text-gray-900 col-forme">${formeCell}</td>
             </tr>
-        `).join('');
+        `;
+        }).join('');
     }
     
+    /**
+     * Update Readiness/Forme block: baseline, EFF today, Forme%, badge, note.
+     * Toggle off = hide block. Toggle on = compute baseline from Z2-strict efforts, show values.
+     */
+    updateReadinessUI() {
+        const block = document.getElementById('readinessBlock');
+        const content = document.getElementById('readinessContent');
+        const note = document.getElementById('readinessNote');
+        const toggle = document.getElementById('useZ2StrictBaseline');
+        if (!block || !content || !note || !toggle) return;
+
+        if (!toggle.checked) {
+            block.classList.add('hidden');
+            this.baselineResult = null;
+            return;
+        }
+
+        block.classList.remove('hidden');
+        this.baselineResult = computeBaseline(this.filteredEfforts, READINESS_CONFIG);
+
+        const effortToday = this.selectedEffortId
+            ? this.filteredEfforts.find(e => String(e.id) === this.selectedEffortId)
+            : this.filteredEfforts[0];
+        const effToday = effortToday ? getEF(effortToday) : null;
+        const readiness = this.baselineResult.baseline ? computeReadiness(effToday, this.baselineResult.baseline) : null;
+
+        const baselineVal = this.baselineResult.baseline != null
+            ? this.baselineResult.baseline.toFixed(3) + ' W/bpm'
+            : '—';
+        const effTodayVal = effToday != null ? effToday.toFixed(3) + ' W/bpm' : '—';
+        let formeVal = '—';
+        let deltaVal = '—';
+        let badgeClass = 'bg-gray-200 text-gray-700';
+
+        if (readiness) {
+            formeVal = readiness.formePct + '%';
+            deltaVal = (readiness.deltaEF >= 0 ? '+' : '') + readiness.deltaEF.toFixed(3) + ' W/bpm';
+            if (readiness.formePct >= 1) badgeClass = 'bg-green-200 text-green-800';
+            else if (readiness.formePct <= -5) badgeClass = 'bg-red-200 text-red-800';
+            else if (readiness.formePct <= -3) badgeClass = 'bg-orange-200 text-orange-800';
+        }
+
+        content.innerHTML = `
+            <div class="stat-card">
+                <div class="stat-value text-sm">${baselineVal}</div>
+                <div class="stat-label">Baseline EFF (W/bpm)</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value text-sm">${effTodayVal}</div>
+                <div class="stat-label">EFF today (W/bpm)</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value"><span class="px-2 py-0.5 rounded ${badgeClass}">${formeVal}</span></div>
+                <div class="stat-label">Forme%</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value text-sm">${deltaVal}</div>
+                <div class="stat-label">ΔEFF</div>
+            </div>
+        `;
+
+        const n = this.baselineResult.count;
+        const topN = READINESS_CONFIG.baselineTopN ?? 10;
+        const days = READINESS_CONFIG.baselineWindowDays ?? 120;
+        note.textContent = n > 0
+            ? `Baseline: median of top ${Math.min(n, topN)} / last ${days} days`
+            : 'No Z2-strict efforts in window. Adjust filters or HR range.';
+    }
+
     updateStatistics() {
         const statsPanel = document.getElementById('statisticsPanel');
         const statsContent = document.getElementById('statsContent');

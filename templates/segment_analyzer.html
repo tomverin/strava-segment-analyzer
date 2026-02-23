@@ -252,6 +252,23 @@
         <div class="grid grid-cols-2 md:grid-cols-6 gap-4" id="statsContent">
             <!-- Statistics will be populated by JavaScript -->
         </div>
+
+        <!-- Readiness / Forme block (Z2 strict baseline) -->
+        <div id="readinessBlock" class="mt-6 pt-4 border-t border-gray-200 hidden">
+            <div class="flex items-center justify-between mb-3">
+                <h3 class="text-lg font-semibold text-gray-900">
+                    <i class="fas fa-heartbeat mr-2"></i>Readiness / Forme
+                </h3>
+                <label class="flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" id="useZ2StrictBaseline" class="rounded border-gray-300" checked>
+                    <span class="text-sm text-gray-700">Use Z2 strict baseline</span>
+                </label>
+            </div>
+            <div id="readinessContent" class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <!-- Populated by JavaScript when toggle is on -->
+            </div>
+            <p class="text-xs text-gray-500 mt-2" id="readinessNote"></p>
+        </div>
     </div>
 
     <!-- Efforts List -->
@@ -276,6 +293,8 @@
                         <th class="col-power text-left font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100" data-sort="average_watts">Power <i class="fas fa-sort ml-0.5"></i></th>
                         <th class="col-vam text-left font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100" data-sort="vam">VAM <i class="fas fa-sort ml-0.5"></i></th>
                         <th class="col-dec text-left font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100" data-sort="decoupling_pct" title="(EF_first−EF_last)/EF_first×100 when 2+ efforts same activity, power ±3%, time ±5%">Pw:Hr <i class="fas fa-sort ml-0.5"></i></th>
+                        <th class="col-z2 text-left font-medium text-gray-500 uppercase tracking-wider" title="Z2 strict valid (HR 132-138, power present)">Z2</th>
+                        <th class="col-forme text-left font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100" data-sort="forme_pct" title="Forme% vs baseline">Forme%</th>
                     </tr>
                 </thead>
                 <tbody class="bg-white divide-y divide-gray-200" id="effortsTableBody">

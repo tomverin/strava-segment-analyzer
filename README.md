@@ -112,3 +112,53 @@ This app requests:
 - Backend: Flask + requests + SQLite
 - Frontend: existing HTML/CSS/JS UI
 - Auth: Strava OAuth 2.0
+
+## How baseline/readiness is computed
+
+The **Readiness / Forme** block shows a fitness indicator based on Z2 (Zone 2) efforts.
+
+### EFF (Efficiency Factor)
+
+- **EFF** = (normalized power or average power) / average heart rate, in **W/bpm**
+- Represented as “Pw:Hr” or “Eff” in the UI
+- Higher EFF at similar HR indicates better fitness
+
+### Z2 strict valid efforts
+
+An effort is **Z2 strict valid** when:
+
+- HR is in the range [132, 138] bpm (configurable: `z2HrMin`, `z2HrMax`)
+- Both `average_heartrate` and power (`normalized_watts` or `average_watts`) are non-null and non-zero
+
+Efforts outside this HR range or without valid HR/power are excluded from the baseline.
+
+### Baseline
+
+- **Window**: last 120 days (configurable: `baselineWindowDays`)
+- **Selection**: among Z2-strict valid efforts in that window, take the **top N** by EFF (N=10 by default, `baselineTopN`)
+- **Baseline** = median of these top N EFF values
+- If fewer than N valid efforts exist, the median of all valid efforts is used
+- If there are no valid efforts in the window, baseline is null
+
+### Forme% (Readiness score)
+
+- **Forme%** = `(EFF_today / baseline - 1) × 100`
+- **ΔEFF** = `EFF_today - baseline`
+- “EFF today” is the selected row (if any) or the most recent effort in the filtered list
+- Rounded to 0.1%
+
+### Badge colors
+
+| Forme% | Color  |
+|--------|--------|
+| ≥ +1%  | Green  |
+| −1% to +1% | Neutral |
+| ≤ −3%  | Orange |
+| ≤ −5%  | Red    |
+
+### UI
+
+- Toggle **Use Z2 strict baseline** to show or hide the Readiness block
+- Click a row in the efforts table to select it for “EFF today”
+- Optional **Z2** column shows which efforts are Z2-strict valid
+- Optional **Forme%** column shows Forme% per effort vs baseline (when baseline is computed)

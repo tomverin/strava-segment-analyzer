@@ -155,7 +155,12 @@ select:focus {
 #effortsTable .col-power { min-width: 4rem; white-space: nowrap; }
 #effortsTable .col-vam { min-width: 5.75rem; white-space: nowrap; }
 #effortsTable .col-dec { width: 1%; white-space: nowrap; }
+#effortsTable .col-z2 { width: 1%; white-space: nowrap; }
+#effortsTable .col-forme { min-width: 4rem; white-space: nowrap; }
 
+.effort-row {
+    cursor: pointer;
+}
 .effort-row:hover {
     background: #fff7f2;
     transition: background-color 0.15s ease;
