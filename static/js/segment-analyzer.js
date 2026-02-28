@@ -187,6 +187,11 @@ class SegmentAnalyzer {
             refreshEffortsBtn.addEventListener('click', () => this.refreshEfforts());
         }
 
+        const importActivityBtn = document.getElementById('importActivityBtn');
+        if (importActivityBtn) {
+            importActivityBtn.addEventListener('click', () => this.importFromActivity());
+        }
+
         const z2Toggle = document.getElementById('useZ2StrictBaseline');
         if (z2Toggle) {
             z2Toggle.addEventListener('change', () => {
@@ -758,6 +763,36 @@ class SegmentAnalyzer {
         } catch (error) {
             console.error('Error refreshing efforts:', error);
             showNotification('Error refreshing efforts', 'error');
+        }
+    }
+
+    async importFromActivity() {
+        const raw = prompt('Enter the Strava Activity ID to import (e.g. 17520224749):');
+        if (!raw) return;
+        const activityId = raw.trim();
+        if (!/^\d+$/.test(activityId)) {
+            showNotification('Invalid activity ID — must be a number', 'error');
+            return;
+        }
+        try {
+            showNotification(`Importing activity ${activityId}…`, 'info');
+            const segmentId = window.segmentData.id;
+            const resp = await fetch(`/segment/${segmentId}/import-activity`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ activity_id: activityId }),
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+                showNotification(`Import failed: ${data.error}`, 'error');
+                return;
+            }
+            showNotification(`Imported ${data.imported} effort(s) — reloading…`, 'success');
+            localStorage.removeItem(`efforts_${window.segmentData.id}`);
+            await this.loadEfforts(true);
+        } catch (err) {
+            console.error('Import error:', err);
+            showNotification('Import error — see console', 'error');
         }
     }
     

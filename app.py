@@ -246,6 +246,12 @@ def build_effort_payload(segment: Dict, raw_efforts: List[Dict], activities: Dic
         if elevation_gain and elapsed:
             vam = round((float(elevation_gain) / elapsed) * 3600, 0)
 
+        # device_watts is present when fetched via /all_efforts; fall back to
+        # the activity-level flag when importing via /activities/{id}.
+        device_watts = effort.get("device_watts")
+        if device_watts is None:
+            device_watts = activity.get("device_watts")
+
         prepared.append(
             {
                 "id": effort.get("id"),
@@ -262,6 +268,7 @@ def build_effort_payload(segment: Dict, raw_efforts: List[Dict], activities: Dic
                 "average_watts": effort.get("average_watts") or activity.get("average_watts"),
                 "normalized_watts": effort.get("weighted_average_watts")
                 or activity.get("weighted_average_watts"),
+                "device_watts": device_watts,
                 "efficiency": None,
                 "vam": vam,
                 "name": activity.get("name") or f"Activity {activity_id}",
@@ -715,6 +722,90 @@ def sync_segment(segment_id):
         return jsonify({"error": f"Sync failed: {exc.message}"}), exc.status_code
     except requests.exceptions.RequestException:
         return jsonify({"error": "Failed to connect to Strava API"}), 502
+
+
+@app.route("/segment/<int:segment_id>/debug/raw-efforts")
+def debug_raw_efforts(segment_id):
+    """Temporary debug: fetch Strava page 1 raw and return all effort IDs/dates."""
+    if "access_token" not in session:
+        return jsonify({"error": "Not authenticated"}), 401
+
+    athlete_id = session.get("athlete_id")
+    athlete_id_int = normalize_athlete_id(athlete_id)
+    if athlete_id_int is None:
+        return jsonify({"error": "No athlete id"}), 401
+
+    pages = []
+    for page in range(1, 3):
+        page_data = fetch_efforts_page(segment_id, page, athlete_id_int)
+        matched = [
+            {
+                "id": e.get("id"),
+                "activity_id": e.get("activity", {}).get("id"),
+                "start_date": e.get("start_date"),
+                "average_watts": e.get("average_watts"),
+                "device_watts": e.get("device_watts"),
+                "average_heartrate": e.get("average_heartrate"),
+            }
+            for e in page_data
+            if normalize_athlete_id(e.get("athlete", {}).get("id")) == athlete_id_int
+        ]
+        pages.append({"page": page, "total_returned": len(page_data), "athlete_efforts": len(matched), "efforts": matched})
+
+    return jsonify(pages)
+
+
+@app.route("/segment/<int:segment_id>/import-activity", methods=["POST"])
+def import_from_activity(segment_id):
+    """Import a specific activity's segment effort directly via /activities/{id}."""
+    if "access_token" not in session:
+        return jsonify({"error": "Not authenticated"}), 401
+
+    athlete_id = session.get("athlete_id")
+    athlete_id_int = normalize_athlete_id(athlete_id)
+    if athlete_id_int is None:
+        return jsonify({"error": "No athlete id"}), 401
+
+    data = request.get_json(silent=True) or {}
+    activity_id = data.get("activity_id")
+    if not activity_id:
+        return jsonify({"error": "activity_id required"}), 400
+
+    try:
+        activity_id_int = int(activity_id)
+    except (ValueError, TypeError):
+        return jsonify({"error": "activity_id must be an integer"}), 400
+
+    try:
+        activity = strava_get(f"/activities/{activity_id_int}")
+    except StravaAPIError as exc:
+        return jsonify({"error": f"Strava API error: {exc.message}"}), exc.status_code
+
+    segment_efforts = activity.get("segment_efforts") or []
+    matching = [e for e in segment_efforts if e.get("segment", {}).get("id") == segment_id]
+
+    if not matching:
+        return jsonify({"error": f"No effort for segment {segment_id} found in activity {activity_id_int}"}), 404
+
+    segment_meta = repository.get_segment(segment_id)
+    if not segment_meta:
+        try:
+            segment_meta = strava_get(f"/segments/{segment_id}")
+            repository.upsert_segment(segment_meta)
+        except StravaAPIError as exc:
+            return jsonify({"error": f"Could not fetch segment metadata: {exc.message}"}), exc.status_code
+
+    repository.upsert_activities(athlete_id_int, {activity_id_int: activity})
+    payload = build_effort_payload(segment_meta, matching, {activity_id_int: activity})
+    repository.upsert_efforts(segment_id=segment_id, athlete_id=athlete_id_int, efforts=payload)
+
+    logger.info(
+        "Imported %s effort(s) for segment=%s from activity=%s",
+        len(payload),
+        segment_id,
+        activity_id_int,
+    )
+    return jsonify({"imported": len(payload), "efforts": payload})
 
 
 @app.route("/segment/<int:segment_id>/efforts")
