@@ -31,16 +31,20 @@ BACKFILL_PAGES_PER_RUN = max(1, int(os.getenv("BACKFILL_PAGES_PER_RUN", "25")))
 MAX_ACTIVITY_FETCHES_PER_PAGE = max(1, int(os.getenv("MAX_ACTIVITY_FETCHES_PER_PAGE", "25")))
 RATE_LIMIT_COOLDOWN_SECONDS = max(60, int(os.getenv("RATE_LIMIT_COOLDOWN_SECONDS", "900")))
 MAX_MISSING_BIKE_REFRESH_PER_RUN = max(1, int(os.getenv("MAX_MISSING_BIKE_REFRESH_PER_RUN", "40")))
+RECENT_ACTIVITY_SCAN_PAGES = max(1, int(os.getenv("RECENT_ACTIVITY_SCAN_PAGES", "2")))
+MAX_ACTIVITY_IMPORTS_PER_RUN = max(1, int(os.getenv("MAX_ACTIVITY_IMPORTS_PER_RUN", "3")))
 
 repository = StravaRepository(os.getenv("STRAVA_DB_PATH", "data/strava.db"))
 rate_limit_cooldowns: Dict[str, float] = {}
 logger.info(
-    "Sync config db_path=%s recent_refresh_pages=%s backfill_pages_per_run=%s max_activity_fetches_per_page=%s max_missing_bike_refresh_per_run=%s rate_limit_cooldown_seconds=%s",
+    "Sync config db_path=%s recent_refresh_pages=%s backfill_pages_per_run=%s max_activity_fetches_per_page=%s max_missing_bike_refresh_per_run=%s recent_activity_scan_pages=%s max_activity_imports_per_run=%s rate_limit_cooldown_seconds=%s",
     repository.db_path,
     RECENT_REFRESH_PAGES,
     BACKFILL_PAGES_PER_RUN,
     MAX_ACTIVITY_FETCHES_PER_PAGE,
     MAX_MISSING_BIKE_REFRESH_PER_RUN,
+    RECENT_ACTIVITY_SCAN_PAGES,
+    MAX_ACTIVITY_IMPORTS_PER_RUN,
     RATE_LIMIT_COOLDOWN_SECONDS,
 )
 
@@ -278,12 +282,9 @@ def build_effort_payload(segment: Dict, raw_efforts: List[Dict], activities: Dic
 
         current = prepared[-1]
         avg_hr = current.get("average_heartrate")
-        if avg_hr and avg_hr > 0:
-            np_watts = current.get("normalized_watts")
-            fallback_watts = current.get("average_watts")
-            selected_watts = np_watts if np_watts is not None else fallback_watts
-            if selected_watts is not None:
-                current["efficiency"] = round(float(selected_watts) / float(avg_hr), 3)
+        avg_watts = current.get("average_watts")
+        if avg_hr and avg_hr > 0 and avg_watts is not None:
+            current["efficiency"] = round(float(avg_watts) / float(avg_hr), 3)
 
     prepared.sort(key=lambda x: x.get("start_date") or "", reverse=True)
     logger.info(
@@ -319,7 +320,7 @@ def compute_decoupling(efforts: List[Dict]) -> None:
         group_sorted = sorted(group, key=lambda x: x.get("start_date") or "")
 
         def get_p(effort: Dict) -> Optional[float]:
-            p = effort.get("normalized_watts") or effort.get("average_watts")
+            p = effort.get("average_watts")
             return float(p) if p is not None else None
 
         def get_ef(effort: Dict) -> Optional[float]:
@@ -405,6 +406,103 @@ def refresh_missing_bike_activities(segment_id: int, athlete_id: int) -> int:
     if refreshed:
         repository.upsert_activities(athlete_id, refreshed)
     return len(refreshed)
+
+
+def sync_recent_efforts(segment_id: int, athlete_id: int, pages: int = 1) -> int:
+    """Lightweight sync for newest efforts only (used on normal page loads)."""
+    if pages <= 0:
+        return 0
+
+    segment_meta = repository.get_segment(segment_id)
+    if not segment_meta:
+        segment_meta = strava_get(f"/segments/{segment_id}")
+        repository.upsert_segment(segment_meta)
+
+    rows_written = 0
+    for page in range(1, pages + 1):
+        page_data = fetch_efforts_page(segment_id, page, athlete_id)
+        if not page_data:
+            break
+
+        page_rows, page_rate_limited = sync_efforts_page(segment_meta, athlete_id, page_data, page)
+        rows_written += page_rows
+        if page_rate_limited or len(page_data) < 200:
+            break
+
+    return rows_written
+
+
+def import_missing_recent_activities(
+    segment_id: int,
+    athlete_id: int,
+    segment_meta: Optional[Dict] = None,
+    max_pages: int = RECENT_ACTIVITY_SCAN_PAGES,
+    max_imports: int = MAX_ACTIVITY_IMPORTS_PER_RUN,
+) -> int:
+    """Fallback import from recent athlete activities when /all_efforts misses newest rows."""
+    if max_pages <= 0 or max_imports <= 0:
+        return 0
+
+    if not segment_meta:
+        segment_meta = repository.get_segment(segment_id)
+        if not segment_meta:
+            segment_meta = strava_get(f"/segments/{segment_id}")
+            repository.upsert_segment(segment_meta)
+
+    imported_efforts = 0
+    imported_activities = 0
+    checked_activities = 0
+
+    for page in range(1, max_pages + 1):
+        logger.info("Fallback scan recent athlete activities page=%s segment=%s", page, segment_id)
+        activities = strava_get("/athlete/activities", params={"per_page": 100, "page": page}) or []
+        if not activities:
+            break
+
+        for activity in activities:
+            activity_id = activity.get("id")
+            if not activity_id:
+                continue
+
+            checked_activities += 1
+            if repository.has_effort_for_activity(segment_id, athlete_id, activity_id):
+                continue
+
+            full_activity = strava_get(f"/activities/{activity_id}")
+            segment_efforts = full_activity.get("segment_efforts") or []
+            matching = [e for e in segment_efforts if e.get("segment", {}).get("id") == segment_id]
+            if not matching:
+                continue
+
+            repository.upsert_activities(athlete_id, {activity_id: full_activity})
+            payload = build_effort_payload(segment_meta, matching, {activity_id: full_activity})
+            repository.upsert_efforts(segment_id=segment_id, athlete_id=athlete_id, efforts=payload)
+            imported_efforts += len(payload)
+            imported_activities += 1
+            logger.info(
+                "Fallback imported activity=%s efforts=%s segment=%s",
+                activity_id,
+                len(payload),
+                segment_id,
+            )
+
+            if imported_activities >= max_imports:
+                logger.info(
+                    "Fallback import reached cap imported_activities=%s imported_efforts=%s checked=%s",
+                    imported_activities,
+                    imported_efforts,
+                    checked_activities,
+                )
+                return imported_efforts
+
+    logger.info(
+        "Fallback import finished imported_activities=%s imported_efforts=%s checked=%s segment=%s",
+        imported_activities,
+        imported_efforts,
+        checked_activities,
+        segment_id,
+    )
+    return imported_efforts
 
 
 def sync_efforts_page(segment: Dict, athlete_id: int, page_data: List[Dict], page: int) -> Tuple[int, bool]:
@@ -526,6 +624,7 @@ def sync_segment_batch(segment_id: int, athlete_id: int) -> List[Dict]:
         raise StravaAPIError(401, "Invalid athlete id in session. Please login again.")
 
     logger.info("Starting batch sync for segment=%s athlete=%s", segment_id, athlete_id_int)
+    initial_effort_count = len(repository.get_efforts(segment_id, athlete_id_int))
 
     segment = strava_get(f"/segments/{segment_id}")
     repository.upsert_segment(segment)
@@ -610,6 +709,21 @@ def sync_segment_batch(segment_id: int, athlete_id: int) -> List[Dict]:
             logger.info("Backfill paused, next run will resume from page=%s", page)
 
     effort_payload = repository.get_efforts(segment_id, athlete_id_int)
+    if len(effort_payload) <= initial_effort_count:
+        fallback_imported = import_missing_recent_activities(
+            segment_id=segment_id,
+            athlete_id=athlete_id_int,
+            segment_meta=segment,
+        )
+        if fallback_imported:
+            logger.info(
+                "Batch fallback recent activity import inserted efforts=%s segment=%s athlete=%s",
+                fallback_imported,
+                segment_id,
+                athlete_id_int,
+            )
+            effort_payload = repository.get_efforts(segment_id, athlete_id_int)
+
     bike_refresh_count = refresh_missing_bike_activities(segment_id, athlete_id_int)
     if bike_refresh_count:
         effort_payload = repository.get_efforts(segment_id, athlete_id_int)
@@ -885,10 +999,32 @@ def get_segment_efforts(segment_id):
                 return add_cache_headers(jsonify(efforts))
             return jsonify({"error": "Failed to connect to Strava API"}), 502
     else:
-        # Opportunistic bike enrichment for previously synced efforts.
+        # Lightweight recent sync on regular loads to pick up newest efforts.
         cooldown_remaining = get_cooldown_remaining_seconds(segment_id, athlete_id_int)
         if cooldown_remaining == 0:
             try:
+                initial_effort_count = len(efforts)
+                recent_rows = sync_recent_efforts(segment_id, athlete_id_int, pages=1)
+                if recent_rows:
+                    logger.info("Recent lightweight sync inserted/updated rows=%s", recent_rows)
+                    efforts = repository.get_efforts(segment_id, athlete_id_int)
+
+                # If effort count did not increase, fallback to recent activity scan/import.
+                if len(efforts) <= initial_effort_count:
+                    imported_from_activities = import_missing_recent_activities(
+                        segment_id=segment_id,
+                        athlete_id=athlete_id_int,
+                    )
+                    if imported_from_activities:
+                        logger.info(
+                            "Fallback recent activity import inserted efforts=%s segment=%s athlete=%s",
+                            imported_from_activities,
+                            segment_id,
+                            athlete_id_int,
+                        )
+                        efforts = repository.get_efforts(segment_id, athlete_id_int)
+
+                # Opportunistic bike enrichment for previously synced efforts.
                 refreshed_bikes = refresh_missing_bike_activities(segment_id, athlete_id_int)
                 if refreshed_bikes:
                     logger.info(

@@ -9,19 +9,18 @@ const READINESS_CONFIG = {
 };
 
 /**
- * EFF (Efficiency Factor) = (NP or Pavg) / HRavg in W/bpm.
+ * EFF (Efficiency Factor) = Pavg(segment) / HRavg in W/bpm.
  * Used for baseline and Forme% calculations.
  */
 function getEF(effort) {
-    if (effort.efficiency != null) return effort.efficiency;
     const hr = effort.average_heartrate;
-    const p = effort.normalized_watts ?? effort.average_watts;
+    const p = effort.average_watts;
     if (hr && hr > 0 && p != null) return p / hr;
     return null;
 }
 
 function getPowerUsed(effort) {
-    return effort.normalized_watts ?? effort.average_watts;
+    return effort.average_watts;
 }
 
 /**
@@ -282,6 +281,27 @@ class SegmentAnalyzer {
             
         } catch (error) {
             console.error('Error loading efforts:', error);
+
+            // If forced refresh is rate-limited, fall back to plain DB read endpoint
+            // so user still sees latest persisted data.
+            if (forceRefresh && error.response?.status === 429) {
+                try {
+                    const fallbackResponse = await axios.get(`/segment/${window.segmentData.id}/efforts`);
+                    const fallbackData = fallbackResponse.data;
+                    this.allEfforts = fallbackData;
+                    computeDecoupling(this.allEfforts);
+                    this.filteredEfforts = [...this.allEfforts];
+                    this.updateBikeFilterOptions();
+                    this.setCachedEfforts(fallbackData);
+                    this.renderEfforts();
+                    this.updateStatistics();
+                    this.applyFilters();
+                    showNotification('Sync limited by rate limit. Showing latest database data.', 'warning');
+                    return;
+                } catch (fallbackError) {
+                    console.error('Fallback load after 429 failed:', fallbackError);
+                }
+            }
             
             // If we have cached data, don't show error, just notify about refresh failure
             if (cachedData && cachedData.length > 0) {
@@ -473,7 +493,7 @@ class SegmentAnalyzer {
                 <td class="text-gray-900">${effort.bike_name || '—'}</td>
                 <td class="text-gray-900 font-mono">${formatTime(effort.elapsed_time)}</td>
                 <td class="text-gray-900">${effort.average_heartrate ? Math.round(effort.average_heartrate) + ' bpm' : '—'}</td>
-                <td class="text-gray-900">${effort.efficiency ? effort.efficiency.toFixed(2) : '—'}</td>
+                <td class="text-gray-900">${eff != null ? eff.toFixed(2) : '—'}</td>
                 <td class="text-gray-900">${effort.average_watts ? Math.round(effort.average_watts) + ' W' : '—'}</td>
                 <td class="text-gray-900">${effort.vam ? effort.vam + ' m/h' : '—'}</td>
                 <td class="text-gray-900">${effort.decoupling_pct != null ? effort.decoupling_pct + '%' : '—'}</td>
@@ -787,9 +807,24 @@ class SegmentAnalyzer {
                 showNotification(`Import failed: ${data.error}`, 'error');
                 return;
             }
-            showNotification(`Imported ${data.imported} effort(s) — reloading…`, 'success');
-            localStorage.removeItem(`efforts_${window.segmentData.id}`);
-            await this.loadEfforts(true);
+            const imported = data.efforts || [];
+            if (imported.length > 0) {
+                const byId = new Map(this.allEfforts.map(e => [String(e.id), e]));
+                imported.forEach(effort => byId.set(String(effort.id), effort));
+                this.allEfforts = Array.from(byId.values()).sort(
+                    (a, b) => new Date(b.start_date) - new Date(a.start_date)
+                );
+                computeDecoupling(this.allEfforts);
+                this.filteredEfforts = [...this.allEfforts];
+                this.updateBikeFilterOptions();
+                this.renderEfforts();
+                this.updateStatistics();
+                this.applyFilters();
+                this.setCachedEfforts(this.allEfforts);
+            }
+            showNotification(`Imported ${data.imported} effort(s)`, 'success');
+            // Then request latest DB view without forcing a heavy refresh path.
+            await this.loadEfforts(false);
         } catch (err) {
             console.error('Import error:', err);
             showNotification('Import error — see console', 'error');

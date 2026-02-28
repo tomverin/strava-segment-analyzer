@@ -164,12 +164,10 @@ class StravaRepository:
                     efficiency = COALESCE(
                         efficiency,
                         CASE
-                            WHEN average_heartrate IS NOT NULL AND average_heartrate > 0 THEN
-                                COALESCE(
-                                    normalized_watts,
-                                    (SELECT a.weighted_average_watts FROM activities a WHERE a.id = efforts.activity_id),
-                                    average_watts
-                                ) / average_heartrate
+                            WHEN average_heartrate IS NOT NULL
+                                 AND average_heartrate > 0
+                                 AND average_watts IS NOT NULL
+                            THEN average_watts / average_heartrate
                             ELSE NULL
                         END
                     )
@@ -381,6 +379,19 @@ class StravaRepository:
                 (segment_id, athlete_id, limit),
             ).fetchall()
         return [row["activity_id"] for row in rows]
+
+    def has_effort_for_activity(self, segment_id: int, athlete_id: int, activity_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM efforts
+                WHERE segment_id = ? AND athlete_id = ? AND activity_id = ?
+                LIMIT 1
+                """,
+                (segment_id, athlete_id, activity_id),
+            ).fetchone()
+        return row is not None
 
     def get_sync_state(self, segment_id: int, athlete_id: int) -> Dict:
         with self._connect() as conn:
