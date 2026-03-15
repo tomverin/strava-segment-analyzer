@@ -421,7 +421,10 @@ class SegmentAnalyzer {
             let aVal = a[field];
             let bVal = b[field];
 
-            if (field === 'forme_pct') {
+            if (field === 'efficiency') {
+                aVal = getEF(a);
+                bVal = getEF(b);
+            } else if (field === 'forme_pct') {
                 const base = this.baselineResult?.baseline;
                 aVal = base && getEF(a) ? computeReadiness(getEF(a), base)?.formePct : null;
                 bVal = base && getEF(b) ? computeReadiness(getEF(b), base)?.formePct : null;
